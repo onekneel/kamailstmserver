@@ -31,28 +31,41 @@ if not os.path.exists(model_path):
 
 # Custom LSTM class to ignore time_major
 class CustomLSTM(LSTM):
+    @classmethod
+    def from_config(cls, config):
+        # Remove time_major from config if present
+        if isinstance(config, dict):
+            config = config.copy()  # Make a copy to avoid modifying original
+            if 'time_major' in config:
+                del config['time_major']
+            if 'config' in config and isinstance(config['config'], dict):
+                if 'time_major' in config['config']:
+                    del config['config']['time_major']
+        return super(CustomLSTM, cls).from_config(config)
+
+    def get_config(self):
+        config = super(CustomLSTM, self).get_config()
+        if 'time_major' in config:
+            del config['time_major']
+        return config
+
     def __init__(self, *args, **kwargs):
-        # Remove time_major from kwargs if present
+        kwargs = kwargs.copy()  # Make a copy to avoid modifying original
         if 'time_major' in kwargs:
             del kwargs['time_major']
-        # Handle possible config dict case
-        if 'config' in kwargs:
+        if 'config' in kwargs and isinstance(kwargs['config'], dict):
             if 'time_major' in kwargs['config']:
                 del kwargs['config']['time_major']
         super(CustomLSTM, self).__init__(*args, **kwargs)
 
-    @classmethod
-    def from_config(cls, config):
-        # Remove time_major from config if present
-        if 'time_major' in config:
-            del config['time_major']
-        return super(CustomLSTM, cls).from_config(config)
-
-# Load model with custom objects
+# Load model with custom objects and handle potential errors
 try:
     model = tf.keras.models.load_model(
         model_path,
-        custom_objects={'LSTM': CustomLSTM}
+        custom_objects={
+            'CustomLSTM': CustomLSTM,
+            'LSTM': CustomLSTM
+        }
     )
     print("Model loaded successfully")
 except Exception as e:
