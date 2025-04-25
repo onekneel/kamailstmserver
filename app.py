@@ -32,8 +32,21 @@ if not os.path.exists(model_path):
 # Custom LSTM class to ignore time_major
 class CustomLSTM(LSTM):
     def __init__(self, *args, **kwargs):
-        kwargs.pop('time_major', None)
+        # Remove time_major from kwargs if present
+        if 'time_major' in kwargs:
+            del kwargs['time_major']
+        # Handle possible config dict case
+        if 'config' in kwargs:
+            if 'time_major' in kwargs['config']:
+                del kwargs['config']['time_major']
         super(CustomLSTM, self).__init__(*args, **kwargs)
+
+    @classmethod
+    def from_config(cls, config):
+        # Remove time_major from config if present
+        if 'time_major' in config:
+            del config['time_major']
+        return super(CustomLSTM, cls).from_config(config)
 
 # Load model with custom objects
 try:
