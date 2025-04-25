@@ -25,7 +25,7 @@ mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
 
 # Load the TensorFlow model
-model_path = os.path.join(os.path.dirname(__file__), "public", "model", "signKamaiLSTM.h5")
+model_path = os.path.join(os.path.dirname(__file__), "public", "model", "signKamaiLSTMFixed.h5")
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"Model file not found at {model_path}")
 
