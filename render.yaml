@@ -4,11 +4,15 @@ services:
     env: python
     plan: free
     region: oregon
-    preBuildCommand: apt-get update && apt-get install -y libopencv-dev libavutil-dev libavcodec-dev libavformat-dev && pip install --upgrade pip
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    preBuildCommand: apt-get update && apt-get install -y libopencv-dev libavutil-dev libavcodec-dev libavformat-dev
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
       - key: PORT
         value: 5000
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: 2
+      - key: TF_ENABLE_ONEDNN_OPTS
+        value: 0
