@@ -8,6 +8,7 @@ import logging
 import json
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
+from tensorflow.keras.layers import LSTM
 import uuid
 
 # Suppress warnings
@@ -28,7 +29,22 @@ model_path = os.path.join(os.path.dirname(__file__), "public", "model", "signKam
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"Model file not found at {model_path}")
 
-model = tf.keras.models.load_model(model_path)
+# Custom LSTM class to ignore time_major
+class CustomLSTM(LSTM):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('time_major', None)
+        super(CustomLSTM, self).__init__(*args, **kwargs)
+
+# Load model with custom objects
+try:
+    model = tf.keras.models.load_model(
+        model_path,
+        custom_objects={'LSTM': CustomLSTM}
+    )
+    print("Model loaded successfully")
+except Exception as e:
+    print(f"Error loading model: {str(e)}")
+    raise
 
 # Configuration
 actions = ['Hello', 'Thankyou', 'Help', 'Please']
@@ -37,7 +53,7 @@ MIN_TEST_FRAMES = 5
 FRAME_SKIP = 1
 CONFIDENCE_THRESHOLD = 0.7
 RESIZE_FACTOR = 1.0
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = 'Uploads'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov'}
 
 # Ensure upload folder exists
@@ -47,7 +63,6 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Your existing functions (mediapipe_detection, extract_keypoints, etc.)
 def mediapipe_detection(image, model):
     h, w = image.shape[:2]
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -127,6 +142,7 @@ def predict_sign_language(video_path, debug=False):
                     if most_common[1] >= 5 and most_common[1] / sum(prediction_counts.values()) > CONFIDENCE_THRESHOLD:
                         break
     cap.release()
+    debug_info["frames_with_hands"] = hand_frame_count
     if hand_frame_count > 0:
         if predictions:
             final_prediction = max(set(predictions), key=predictions.count)
