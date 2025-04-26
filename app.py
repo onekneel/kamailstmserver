@@ -86,11 +86,13 @@ except Exception as e:
 actions = ['Hello', 'Thankyou', 'Help', 'Please']
 sequence_length = 30
 MIN_TEST_FRAMES = 5
-FRAME_SKIP = 1
+FRAME_SKIP = 2  # Skip more frames
 CONFIDENCE_THRESHOLD = 0.7
-RESIZE_FACTOR = 1.0
+RESIZE_FACTOR = 0.5  # Reduce frame size
 UPLOAD_FOLDER = 'Uploads'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov'}
+MAX_VIDEO_DURATION = 30  # Maximum video duration in seconds
+MAX_FRAME_COUNT = 900  # Maximum number of frames to process
 
 # Ensure upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -136,9 +138,25 @@ def normalize_keypoints(sequence):
     return (sequence - min_val) / range_val
 
 def predict_sign_language(video_path, debug=False):
+    # Add video duration check
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"action": "None", "confidence": 0.0, "error": "Could not open video", "debug_info": {}}
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    # Check video duration
+    if duration > MAX_VIDEO_DURATION:
+        cap.release()
+        return {"action": "None", "confidence": 0.0, "error": f"Video too long ({duration:.1f}s). Maximum {MAX_VIDEO_DURATION}s allowed", "debug_info": {}}
+    
+    if total_frames > MAX_FRAME_COUNT:
+        cap.release()
+        return {"action": "None", "confidence": 0.0, "error": f"Too many frames ({total_frames}). Maximum {MAX_FRAME_COUNT} allowed", "debug_info": {}}
+
     sequence = []
     predictions = []
     hand_frame_count = 0
