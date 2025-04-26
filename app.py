@@ -7,6 +7,7 @@ import warnings
 import logging
 import json
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from tensorflow.keras.layers import LSTM
 import uuid
@@ -19,6 +20,15 @@ logging.getLogger("mediapipe").setLevel(logging.ERROR)
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Configure CORS to allow specific origin
+CORS(app, resources={
+    r"/predict": {
+        "origins": ["https://kamaibisubilar.vercel.app"],
+        "methods": ["POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 # MediaPipe setup
 mp_holistic = mp.solutions.holistic
@@ -200,8 +210,12 @@ def predict_sign_language(video_path, debug=False):
 def index():
     return jsonify({"message": "Sign Language Prediction API", "status": "running"})
 
-@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
+    # Handle preflight OPTIONS request
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     if 'video' not in request.files:
         return jsonify({"error": "No video file provided"}), 400
     file = request.files['video']
