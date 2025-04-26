@@ -11,7 +11,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.9.18
       - key: PORT
-        value: 5000
+        value: 10000
       - key: TF_CPP_MIN_LOG_LEVEL
         value: 2
       - key: TF_ENABLE_ONEDNN_OPTS
