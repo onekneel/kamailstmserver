@@ -11,21 +11,32 @@ import time
 import gc
 
 # Configure TensorFlow to be memory-efficient
-# This won't affect model accuracy, just how memory is allocated
-physical_devices = tf.config.list_physical_devices('GPU')
-if physical_devices:
-    for device in physical_devices:
-        tf.config.experimental.set_memory_growth(device, True)
-else:
-    # If no GPU, limit CPU memory growth
+try:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if physical_devices:
+        logger.info(f"Found {len(physical_devices)} GPU(s)")
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+            logger.info(f"Enabled memory growth for GPU: {device}")
+    else:
+        logger.warning("No GPU devices found, using CPU only")
+        # If no GPU, limit CPU memory growth
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+except Exception as e:
+    logger.error(f"Error configuring TensorFlow devices: {e}")
+    # Fallback to CPU configuration
     tf.config.threading.set_inter_op_parallelism_threads(1)
     tf.config.threading.set_intra_op_parallelism_threads(1)
 
 app = Flask(__name__)
 CORS(app, resources={r"/predict": {"origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"]}})
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up logging with more detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize MediaPipe Holistic
@@ -173,6 +184,27 @@ def get_model():
             logger.error(f"Error loading model: {e}")
             model = None
     return model
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    return jsonify({
+        'error': 'Internal server error',
+        'details': str(e) if app.debug else 'An unexpected error occurred'
+    }), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    try:
+        # Basic health check
+        if mp_holistic is None:
+            return jsonify({'status': 'error', 'message': 'MediaPipe not initialized'}), 503
+        if get_model() is None:
+            return jsonify({'status': 'error', 'message': 'Model not loaded'}), 503
+        return jsonify({'status': 'healthy'}), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 503
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -368,5 +400,9 @@ def predict():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
+    port = int(os.environ.get('PORT', 10000))
+    # Add startup logging
+    logger.info(f"Starting server on port {port}")
+    logger.info(f"Debug mode: {app.debug}")
+    logger.info(f"CUDA available: {tf.test.is_built_with_cuda()}")
     app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production
