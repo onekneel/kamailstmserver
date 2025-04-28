@@ -156,6 +156,20 @@ except Exception as e:
     logger.error(f"Error loading model: {e}")
     model = None
 
+def process_video_frame(frame, holistic):
+    """Process a single frame with memory cleanup"""
+    try:
+        image, results = mediapipe_detection(frame, holistic)
+        keypoints = None
+        if has_hand_keypoints(results):
+            keypoints = extract_keypoints(results)
+        # Clear MediaPipe resources
+        del image
+        return keypoints
+    except Exception as e:
+        logger.error(f"Error processing frame: {e}")
+        return None
+
 @app.route('/predict', methods=['POST'])
 def predict():
     logger.debug("Received request to /predict")
@@ -188,42 +202,50 @@ def predict():
         return jsonify({'error': f'Failed to save video file: {e}'}), 500
 
     try:
-        # Process video
-        cap = cv2.VideoCapture(temp_file_path)
-        if not cap.isOpened():
-            cap.release()
-            cv2.destroyAllWindows()
-            safe_unlink(temp_file_path)
-            logger.error("Failed to open video file")
-            return jsonify({'error': 'Failed to open video file'}), 500
-
+        # Process video with memory optimization
         sequence = []
         hand_frame_count = 0
-        with mp_holistic.Holistic(min_detection_confidence=0.3, min_tracking_confidence=0.3) as holistic:
-            while len(sequence) < sequence_length:
+        frame_count = 0
+        max_frames = min(90, sequence_length * 2)  # Limit total frames processed
+        
+        with mp_holistic.Holistic(
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+            static_image_mode=True  # Process frames independently to prevent memory accumulation
+        ) as holistic:
+            cap = cv2.VideoCapture(temp_file_path)
+            if not cap.isOpened():
+                raise ValueError("Failed to open video file")
+
+            while frame_count < max_frames and len(sequence) < sequence_length:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                image, results = mediapipe_detection(frame, holistic)
-                if has_hand_keypoints(results):
-                    try:
-                        keypoints = extract_keypoints(results)
-                        sequence.append(keypoints)
-                        hand_frame_count += 1
-                    except AttributeError as e:
-                        logger.warning(f"Skipping frame due to missing landmarks: {e}")
-                        continue
-            if hand_frame_count >= MIN_TEST_FRAMES:
-                while len(sequence) < sequence_length:
-                    sequence.append(sequence[-1] if sequence else np.zeros(33*4 + 21*3 + 21*3 + 18))
-            else:
-                cap.release()
-                cv2.destroyAllWindows()
-                safe_unlink(temp_file_path)
-                logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
-                return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
-        cap.release()
-        cv2.destroyAllWindows()
+                
+                frame_count += 1
+                # Reduce frame size to save memory
+                frame = cv2.resize(frame, (320, 240))
+                
+                keypoints = process_video_frame(frame, holistic)
+                if keypoints is not None:
+                    sequence.append(keypoints)
+                    hand_frame_count += 1
+                
+                # Force garbage collection every 10 frames
+                if frame_count % 10 == 0:
+                    tf.keras.backend.clear_session()
+                
+            cap.release()
+            cv2.destroyAllWindows()
+
+        if hand_frame_count >= MIN_TEST_FRAMES:
+            while len(sequence) < sequence_length:
+                sequence.append(sequence[-1] if sequence else np.zeros(33*4 + 21*3 + 21*3 + 18))
+        else:
+            safe_unlink(temp_file_path)
+            logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
+            return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
+
         logger.debug(f"Extracted {hand_frame_count} frames with hand keypoints")
 
         # Apply global normalization
@@ -276,7 +298,13 @@ def predict():
         if os.path.exists(temp_file_path):
             safe_unlink(temp_file_path)
         return jsonify({'error': str(e)}), 500
+    finally:
+        # Cleanup
+        tf.keras.backend.clear_session()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
+    # Add timeout configuration for gunicorn
+    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 120))
+    app.config['WORKER_TIMEOUT'] = timeout_seconds
     app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production
