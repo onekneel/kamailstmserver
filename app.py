@@ -1,129 +1,78 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import cv2
 import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 import os
-import warnings
+import tempfile
 import logging
-import json
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-from tensorflow.keras.layers import LSTM
-import uuid
+import time
 
-# Suppress warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-warnings.filterwarnings("ignore")
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
-logging.getLogger("mediapipe").setLevel(logging.ERROR)
-
-# Initialize Flask app
 app = Flask(__name__)
+CORS(app, resources={r"/predict": {"origins": ["http://localhost:3000", "http://192.168.1.3:3000"]}})
 
-# Configure CORS to allow specific origin
-CORS(app, resources={
-    r"/predict": {
-        "origins": ["https://kamaibisubilar.vercel.app"],
-        "methods": ["POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
-    }
-})
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# MediaPipe setup
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
-
-# Load the TensorFlow model
-model_path = os.path.join(os.path.dirname(__file__), "public", "model", "KamaiLSTMTimeMajor.h5")
-if not os.path.exists(model_path):
-    raise FileNotFoundError(f"Model file not found at {model_path}")
-
-# Custom LSTM class to ignore time_major
-class CustomLSTM(LSTM):
-    @classmethod
-    def from_config(cls, config):
-        # Remove time_major from config if present
-        if isinstance(config, dict):
-            config = config.copy()  # Make a copy to avoid modifying original
-            if 'time_major' in config:
-                del config['time_major']
-            if 'config' in config and isinstance(config['config'], dict):
-                if 'time_major' in config['config']:
-                    del config['config']['time_major']
-        return super(CustomLSTM, cls).from_config(config)
-
-    def get_config(self):
-        config = super(CustomLSTM, self).get_config()
-        if 'time_major' in config:
-            del config['time_major']
-        return config
-
-    def __init__(self, *args, **kwargs):
-        kwargs = kwargs.copy()  # Make a copy to avoid modifying original
-        if 'time_major' in kwargs:
-            del kwargs['time_major']
-        if 'config' in kwargs and isinstance(kwargs['config'], dict):
-            if 'time_major' in kwargs['config']:
-                del kwargs['config']['time_major']
-        super(CustomLSTM, self).__init__(*args, **kwargs)
-
-# Load model with custom objects and handle potential errors
+# Initialize MediaPipe Holistic
 try:
-    model = tf.keras.models.load_model(
-        model_path,
-        custom_objects={
-            'CustomLSTM': CustomLSTM,
-            'LSTM': CustomLSTM
-        }
-    )
-    print("Model loaded successfully")
+    mp_holistic = mp.solutions.holistic
+    mp_drawing = mp.solutions.drawing_utils
 except Exception as e:
-    print(f"Error loading model: {str(e)}")
-    raise
-
-# Configuration
-actions = ['Hello', 'Thankyou', 'Help', 'Please']
-sequence_length = 30
-MIN_TEST_FRAMES = 5
-FRAME_SKIP = 2  # Skip more frames
-CONFIDENCE_THRESHOLD = 0.7
-RESIZE_FACTOR = 0.5  # Reduce frame size
-UPLOAD_FOLDER = 'Uploads'
-ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov'}
-MAX_VIDEO_DURATION = 30  # Maximum video duration in seconds
-MAX_FRAME_COUNT = 900  # Maximum number of frames to process
-
-# Ensure upload folder exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    logger.error(f"Failed to initialize MediaPipe: {e}")
+    mp_holistic = None
+    mp_drawing = None
 
 def mediapipe_detection(image, model):
-    h, w = image.shape[:2]
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image_rgb = cv2.convertScaleAbs(image_rgb, alpha=1.2, beta=10)
-    results = model.process(image_rgb)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = model.process(image)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     return image, results
 
 def extract_keypoints(results):
-    pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33*4)
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
-    additional_features = np.zeros(6)
+    # Initialize zero arrays for all keypoints
+    pose = np.zeros(33*4)
+    lh = np.zeros(21*3)
+    rh = np.zeros(21*3)
+    additional_features = np.zeros(18)
+
+    # Extract pose landmarks if available
+    if results.pose_landmarks:
+        pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten()
+
+    # Extract hand landmarks if available
+    if results.left_hand_landmarks:
+        lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten()
+    if results.right_hand_landmarks:
+        rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten()
+
+    # Compute additional features if pose and at least one hand are present
     if results.pose_landmarks and (results.left_hand_landmarks or results.right_hand_landmarks):
         head = np.array([results.pose_landmarks.landmark[0].x, results.pose_landmarks.landmark[0].y, results.pose_landmarks.landmark[0].z])
         left_shoulder = np.array([results.pose_landmarks.landmark[11].x, results.pose_landmarks.landmark[11].y, results.pose_landmarks.landmark[11].z])
         right_shoulder = np.array([results.pose_landmarks.landmark[12].x, results.pose_landmarks.landmark[12].y, results.pose_landmarks.landmark[12].z])
         chest = (left_shoulder + right_shoulder) / 2
+        chin = np.zeros(3)
+        forehead = np.zeros(3)
+        if results.face_landmarks:
+            chin = np.array([results.face_landmarks.landmark[152].x, results.face_landmarks.landmark[152].y, results.face_landmarks.landmark[152].z])
+            forehead = np.array([results.face_landmarks.landmark[10].x, results.face_landmarks.landmark[10].y, results.face_landmarks.landmark[10].z])
+        left_elbow = np.array([results.pose_landmarks.landmark[13].x, results.pose_landmarks.landmark[13].y, results.pose_landmarks.landmark[13].z])
+        right_elbow = np.array([results.pose_landmarks.landmark[14].x, results.pose_landmarks.landmark[14].y, results.pose_landmarks.landmark[14].z])
+        
         if results.left_hand_landmarks:
             lh_center = np.array([results.left_hand_landmarks.landmark[0].x, results.left_hand_landmarks.landmark[0].y, results.left_hand_landmarks.landmark[0].z])
             additional_features[0:3] = lh_center - head
+            additional_features[6:9] = lh_center - chin
+            additional_features[9:12] = lh_center - forehead
+            additional_features[12:15] = lh_center - left_elbow
         if results.right_hand_landmarks:
             rh_center = np.array([results.right_hand_landmarks.landmark[0].x, results.right_hand_landmarks.landmark[0].y, results.right_hand_landmarks.landmark[0].z])
             additional_features[3:6] = rh_center - chest
+            additional_features[15:18] = rh_center - right_elbow
+    
     return np.concatenate([pose, lh, rh, additional_features])
 
 def has_hand_keypoints(results):
@@ -131,127 +80,201 @@ def has_hand_keypoints(results):
     rh_present = results.right_hand_landmarks is not None
     return lh_present or rh_present
 
-def normalize_keypoints(sequence):
-    min_val = np.min(sequence, axis=0)
-    max_val = np.max(sequence, axis=0)
-    range_val = np.maximum(max_val - min_val, 1e-6)
-    return (sequence - min_val) / range_val
+def normalize_keypoints(sequences, min_val, max_val):
+    sequences = np.array(sequences)
+    range_val = max_val - min_val
+    range_val[range_val < 1e-6] = 1e-6
+    return (sequences - min_val) / range_val
 
-def predict_sign_language(video_path, debug=False):
-    # Add video duration check
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return {"action": "None", "confidence": 0.0, "error": "Could not open video", "debug_info": {}}
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps > 0 else 0
-    
-    # Check video duration
-    if duration > MAX_VIDEO_DURATION:
-        cap.release()
-        return {"action": "None", "confidence": 0.0, "error": f"Video too long ({duration:.1f}s). Maximum {MAX_VIDEO_DURATION}s allowed", "debug_info": {}}
-    
-    if total_frames > MAX_FRAME_COUNT:
-        cap.release()
-        return {"action": "None", "confidence": 0.0, "error": f"Too many frames ({total_frames}). Maximum {MAX_FRAME_COUNT} allowed", "debug_info": {}}
+def safe_unlink(file_path, retries=5, delay=1.0):
+    """Attempt to delete a file with retries to handle Windows file locking issues."""
+    for attempt in range(retries):
+        try:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+                logger.debug(f"Successfully deleted {file_path}")
+            return True
+        except PermissionError as e:
+            logger.warning(f"Attempt {attempt + 1} failed to delete {file_path}: {e}")
+            time.sleep(delay)
+    logger.error(f"Failed to delete {file_path} after {retries} attempts")
+    return False
 
-    sequence = []
-    predictions = []
-    hand_frame_count = 0
-    frame_count = 0
-    prediction_counts = {}
-    debug_info = {"total_frames": 0, "frames_with_hands": 0, "video_path": video_path}
-    holistic_config = {
-        'static_image_mode': False,
-        'min_detection_confidence': 0.5,
-        'min_tracking_confidence': 0.5,
-        'model_complexity': 1
-    }
-    with mp_holistic.Holistic(**holistic_config) as holistic:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_count += 1
-            debug_info["total_frames"] = frame_count
-            if frame_count % FRAME_SKIP != 0:
-                continue
-            h, w = frame.shape[:2]
-            frame = cv2.resize(frame, (int(w * RESIZE_FACTOR), int(h * RESIZE_FACTOR)))
-            frame, results = mediapipe_detection(frame, holistic)
-            if has_hand_keypoints(results):
-                keypoints = extract_keypoints(results)
-                sequence.append(keypoints)
-                hand_frame_count += 1
-                if len(sequence) >= sequence_length:
-                    window = sequence[-sequence_length:]
-                    norm_window = normalize_keypoints(np.array(window))
-                    res = model.predict(np.expand_dims(norm_window, axis=0), verbose=0)[0]
-                    predicted_action = actions[np.argmax(res)]
-                    predictions.append(predicted_action)
-                    prediction_counts[predicted_action] = prediction_counts.get(predicted_action, 0) + 1
-                    most_common = max(prediction_counts.items(), key=lambda x: x[1]) if prediction_counts else (None, 0)
-                    if most_common[1] >= 5 and most_common[1] / sum(prediction_counts.values()) > CONFIDENCE_THRESHOLD:
-                        break
-    cap.release()
-    debug_info["frames_with_hands"] = hand_frame_count
-    if hand_frame_count > 0:
-        if predictions:
-            final_prediction = max(set(predictions), key=predictions.count)
-            confidence = float(max([predictions.count(p) / len(predictions) for p in set(predictions)]) * 100)
-            return {
-                "action": final_prediction,
-                "confidence": confidence,
-                "frame_count": hand_frame_count,
-                "prediction_distribution": dict((x, predictions.count(x)) for x in set(predictions)),
-                "debug_info": debug_info
-            }
-        else:
-            return {
-                "action": "None",
-                "confidence": 0.0,
-                "error": "No predictions made (insufficient frames for sliding window)",
-                "debug_info": debug_info
-            }
+# Configuration
+actions = ['Goodbye', 'Hello', 'Thankyou', 'Please', 'Thankyou(FSL)', 'Wait(FSL)']
+sequence_length = 30
+MIN_TEST_FRAMES = 10
+
+# Load precomputed min/max values
+min_val_path = 'C:\\lstmserver\\kamailstmserver\\public\\keypoints\\min_val.npy'
+max_val_path = 'C:\\lstmserver\\kamailstmserver\\public\\keypoints\\max_val.npy'
+try:
+    if os.path.exists(min_val_path) and os.path.exists(max_val_path):
+        min_val = np.load(min_val_path)
+        max_val = np.load(max_val_path)
+        logger.info("Loaded min/max values successfully")
     else:
-        return {
-            "action": "None",
-            "confidence": 0.0,
-            "error": f"Too few frames with hand keypoints ({hand_frame_count})",
-            "debug_info": debug_info
-        }
+        raise FileNotFoundError("Min/max files not found")
+except Exception as e:
+    logger.warning(f"Min/Max files not found or error loading: {e}. Using default values (may reduce accuracy).")
+    keypoint_dim = 33*4 + 21*3 + 21*3 + 18
+    min_val = np.zeros(keypoint_dim)
+    max_val = np.ones(keypoint_dim)
+    min_val[:33*4:4] = 0
+    max_val[:33*4:4] = 1
+    min_val[1:33*4:4] = 0
+    max_val[1:33*4:4] = 1
+    min_val[2:33*4:4] = -1
+    max_val[2:33*4:4] = 1
+    min_val[3:33*4:4] = 0
+    max_val[3:33*4:4] = 1
+    min_val[33*4:33*4+21*3:3] = 0
+    max_val[33*4:33*4+21*3:3] = 1
+    min_val[33*4+1:33*4+21*3:3] = 0
+    max_val[33*4+1:33*4+21*3:3] = 1
+    min_val[33*4+2:33*4+21*3:3] = -1
+    max_val[33*4+2:33*4+21*3:3] = 1
+    min_val[33*4+21*3:33*4+21*3+21*3:3] = 0
+    max_val[33*4+21*3:33*4+21*3+21*3:3] = 1
+    min_val[33*4+21*3+1:33*4+21*3+21*3:3] = 0
+    max_val[33*4+21*3+1:33*4+21*3+21*3:3] = 1
+    min_val[33*4+21*3+2:33*4+21*3+21*3:3] = -1
+    max_val[33*4+21*3+2:33*4+21*3+21*3:3] = 1
+    min_val[33*4+21*3+21*3:] = -1
+    max_val[33*4+21*3+21*3:] = 1
 
-# Flask Routes
-@app.route('/')
-def index():
-    return jsonify({"message": "Sign Language Prediction API", "status": "running"})
+# Load model
+model_path = 'C:\\lstmserver\\kamailstmserver\\public\\model\\kamaibestlstm_Modified.keras'
+try:
+    if os.path.exists(model_path):
+        model = tf.keras.models.load_model(model_path)
+        logger.info("Model loaded successfully")
+    else:
+        raise FileNotFoundError("Model file not found")
+except Exception as e:
+    logger.error(f"Error loading model: {e}")
+    model = None
 
-@app.route('/predict', methods=['POST', 'OPTIONS'])
+@app.route('/predict', methods=['POST'])
 def predict():
-    # Handle preflight OPTIONS request
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
+    logger.debug("Received request to /predict")
+    if model is None:
+        logger.error("Model not loaded")
+        return jsonify({'error': 'Model not loaded'}), 500
+
+    if mp_holistic is None:
+        logger.error("MediaPipe not initialized")
+        return jsonify({'error': 'MediaPipe not initialized'}), 500
 
     if 'video' not in request.files:
-        return jsonify({"error": "No video file provided"}), 400
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    if file and allowed_file(file.filename):
-        filename = secure_filename(f"{uuid.uuid4().hex}_{file.filename}")
-        video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(video_path)
-        try:
-            result = predict_sign_language(video_path, debug=False)
-            os.remove(video_path)  # Clean up uploaded file
-            return jsonify(result)
-        except Exception as e:
-            os.remove(video_path)  # Clean up on error
-            return jsonify({"error": str(e)}), 500
-    else:
-        return jsonify({"error": "Invalid file type. Allowed: mp4, avi, mov"}), 400
+        logger.error("No video file provided")
+        return jsonify({'error': 'No video file provided'}), 400
+
+    video_file = request.files['video']
+    if video_file.filename == '':
+        logger.error("No video file selected")
+        return jsonify({'error': 'No video file selected'}), 400
+
+    # Save video to temporary file
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, f"video_{int(time.time())}.mp4")
+    try:
+        video_file.save(temp_file_path)
+        logger.debug(f"Video saved to temporary file: {temp_file_path}")
+    except Exception as e:
+        logger.error(f"Failed to save video file: {e}")
+        safe_unlink(temp_file_path)
+        return jsonify({'error': f'Failed to save video file: {e}'}), 500
+
+    try:
+        # Process video
+        cap = cv2.VideoCapture(temp_file_path)
+        if not cap.isOpened():
+            cap.release()
+            cv2.destroyAllWindows()
+            safe_unlink(temp_file_path)
+            logger.error("Failed to open video file")
+            return jsonify({'error': 'Failed to open video file'}), 500
+
+        sequence = []
+        hand_frame_count = 0
+        with mp_holistic.Holistic(min_detection_confidence=0.3, min_tracking_confidence=0.3) as holistic:
+            while len(sequence) < sequence_length:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                image, results = mediapipe_detection(frame, holistic)
+                if has_hand_keypoints(results):
+                    try:
+                        keypoints = extract_keypoints(results)
+                        sequence.append(keypoints)
+                        hand_frame_count += 1
+                    except AttributeError as e:
+                        logger.warning(f"Skipping frame due to missing landmarks: {e}")
+                        continue
+            if hand_frame_count >= MIN_TEST_FRAMES:
+                while len(sequence) < sequence_length:
+                    sequence.append(sequence[-1] if sequence else np.zeros(33*4 + 21*3 + 21*3 + 18))
+            else:
+                cap.release()
+                cv2.destroyAllWindows()
+                safe_unlink(temp_file_path)
+                logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
+                return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
+        cap.release()
+        cv2.destroyAllWindows()
+        logger.debug(f"Extracted {hand_frame_count} frames with hand keypoints")
+
+        # Apply global normalization
+        norm_sequence = normalize_keypoints(np.array([sequence]), min_val, max_val)[0]
+        logger.debug("Applied global normalization")
+
+        # Predict
+        predictions = []
+        confidences = []
+        for i in range(len(norm_sequence) - sequence_length + 1):
+            window = norm_sequence[i:i + sequence_length]
+            if len(window) == sequence_length:
+                res = model.predict(np.expand_dims(window, axis=0), verbose=0)[0]
+                predicted_action = actions[np.argmax(res)]
+                confidence = float(res[np.argmax(res)] * 100)
+                logger.debug(f"Window {i}: Predicted {predicted_action} with confidence {confidence}%")
+                predictions.append(predicted_action)
+                confidences.append(confidence)
+
+        if not predictions:
+            safe_unlink(temp_file_path)
+            logger.error("No predictions made (insufficient frames for sliding window)")
+            return jsonify({'error': 'No predictions made (insufficient frames for sliding window)'}), 400
+
+        # Handle Wait(FSL) misclassification
+        final_prediction = max(set(predictions), key=predictions.count)
+        final_confidence = np.mean([conf for pred, conf in zip(predictions, confidences) if pred == final_prediction])
+        
+        # Confidence-based adjustment for Wait(FSL)
+        if final_prediction == 'Goodbye':
+            wait_fsl_conf = np.mean([conf for pred, conf in zip(predictions, confidences) if pred == 'Wait(FSL)']) if 'Wait(FSL)' in predictions else 0
+            if wait_fsl_conf > 0 and (final_confidence - wait_fsl_conf) < 15:  # Increased threshold
+                final_prediction = 'Wait(FSL)'
+                final_confidence = wait_fsl_conf
+                logger.debug("Adjusted prediction to Wait(FSL) due to close confidence")
+
+        # Format response for frontend
+        response = {
+            'action': final_prediction,
+            'confidence': final_confidence
+        }
+        logger.info(f"Prediction: {final_prediction} with confidence {final_confidence}%")
+
+        # Clean up
+        safe_unlink(temp_file_path)
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Error processing video: {e}")
+        if os.path.exists(temp_file_path):
+            safe_unlink(temp_file_path)
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    app.run(host='0.0.0.0', port=10000, debug=True)

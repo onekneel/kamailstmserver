@@ -3,6 +3,10 @@ flask-cors>=4.0.0
 numpy>=1.22,<1.24
 opencv-python>=4.8.0.76
 mediapipe>=0.10.9
-tensorflow==2.10.0
+tensorflow==2.18.0
 Werkzeug>=2.3.7
 gunicorn>=21.2.0
+onnxruntime-gpu>=1.15.0
+numba>=0.57.1
+Pillow>=10.0.0
+concurrent-futures>=3.0.5
