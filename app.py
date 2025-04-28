@@ -106,15 +106,16 @@ sequence_length = 30
 MIN_TEST_FRAMES = 10
 
 # Load precomputed min/max values
-min_val_path = 'C:\\lstmserver\\kamailstmserver\\public\\keypoints\\min_val.npy'
-max_val_path = 'C:\\lstmserver\\kamailstmserver\\public\\keypoints\\max_val.npy'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'min_val.npy')
+max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'max_val.npy')
 try:
     if os.path.exists(min_val_path) and os.path.exists(max_val_path):
         min_val = np.load(min_val_path)
         max_val = np.load(max_val_path)
         logger.info("Loaded min/max values successfully")
     else:
-        raise FileNotFoundError("Min/max files not found")
+        raise FileNotFoundError(f"Min/max files not found at {min_val_path} and {max_val_path}")
 except Exception as e:
     logger.warning(f"Min/Max files not found or error loading: {e}. Using default values (may reduce accuracy).")
     keypoint_dim = 33*4 + 21*3 + 21*3 + 18
@@ -144,13 +145,13 @@ except Exception as e:
     max_val[33*4+21*3+21*3:] = 1
 
 # Load model
-model_path = 'C:\\lstmserver\\kamailstmserver\\public\\model\\kamaibestlstm_Modified.keras'
+model_path = os.path.join(BASE_DIR, 'public', 'model', 'kamaibestlstm_Modified.keras')
 try:
     if os.path.exists(model_path):
         model = tf.keras.models.load_model(model_path)
         logger.info("Model loaded successfully")
     else:
-        raise FileNotFoundError("Model file not found")
+        raise FileNotFoundError(f"Model file not found at {model_path}")
 except Exception as e:
     logger.error(f"Error loading model: {e}")
     model = None
@@ -277,4 +278,5 @@ def predict():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000, debug=True)
+    port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
+    app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production
