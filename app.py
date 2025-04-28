@@ -22,7 +22,7 @@ else:
     tf.config.threading.set_intra_op_parallelism_threads(1)
 
 app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": ["http://localhost:3000", "http://192.168.1.3:3000"]}})
+CORS(app, resources={r"/predict": {"origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"]}})
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
