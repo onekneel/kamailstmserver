@@ -1,7 +1,7 @@
 import os
 
 # Timeout configuration
-timeout = int(os.environ.get('WORKER_TIMEOUT', 120))
+timeout = int(os.environ.get('WORKER_TIMEOUT', 300))
 graceful_timeout = timeout
 keepalive = 5
 

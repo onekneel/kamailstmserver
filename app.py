@@ -305,6 +305,6 @@ def predict():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
     # Add timeout configuration for gunicorn
-    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 120))
+    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 300))
     app.config['WORKER_TIMEOUT'] = timeout_seconds
     app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production
