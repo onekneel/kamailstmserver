@@ -10,7 +10,25 @@ import logging
 import time
 
 app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"]}})
+CORS(app, resources={
+    r"/predict": {
+        "origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"],
+        "methods": ["POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"],
+        "expose_headers": ["Access-Control-Allow-Origin"],
+        "supports_credentials": True,
+        "max_age": 600
+    }
+})
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', 'https://kamaibisubilar.vercel.app')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    response.headers.add('Access-Control-Max-Age', '600')
+    return response
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -176,8 +194,11 @@ def process_video_frame(frame, holistic):
         logger.error(f"Error processing frame: {e}")
         return None
 
-@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     logger.debug("Received request to /predict")
     if model is None:
         logger.error("Model not loaded")
