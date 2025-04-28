@@ -156,15 +156,21 @@ except Exception as e:
     logger.error(f"Error loading model: {e}")
     model = None
 
+MAX_FRAME_WIDTH = 240  # Reduced frame size
+MAX_FRAME_HEIGHT = 180
+BATCH_SIZE = 4  # Process predictions in smaller batches
+
 def process_video_frame(frame, holistic):
     """Process a single frame with memory cleanup"""
     try:
+        # Resize frame to reduce memory usage
+        frame = cv2.resize(frame, (MAX_FRAME_WIDTH, MAX_FRAME_HEIGHT))
         image, results = mediapipe_detection(frame, holistic)
         keypoints = None
         if has_hand_keypoints(results):
             keypoints = extract_keypoints(results)
         # Clear MediaPipe resources
-        del image
+        del image, results
         return keypoints
     except Exception as e:
         logger.error(f"Error processing frame: {e}")
@@ -206,7 +212,7 @@ def predict():
         sequence = []
         hand_frame_count = 0
         frame_count = 0
-        max_frames = min(90, sequence_length * 2)  # Limit total frames processed
+        max_frames = min(60, sequence_length * 1.5)  # Reduced max frames
         
         with mp_holistic.Holistic(
             min_detection_confidence=0.3,
@@ -223,17 +229,19 @@ def predict():
                     break
                 
                 frame_count += 1
-                # Reduce frame size to save memory
-                frame = cv2.resize(frame, (320, 240))
-                
                 keypoints = process_video_frame(frame, holistic)
                 if keypoints is not None:
                     sequence.append(keypoints)
                     hand_frame_count += 1
                 
-                # Force garbage collection every 10 frames
-                if frame_count % 10 == 0:
+                # Clear memory more frequently
+                if frame_count % 5 == 0:
                     tf.keras.backend.clear_session()
+                    
+                # Force garbage collection
+                if frame_count % 10 == 0:
+                    import gc
+                    gc.collect()
                 
             cap.release()
             cv2.destroyAllWindows()
@@ -255,15 +263,19 @@ def predict():
         # Predict
         predictions = []
         confidences = []
-        for i in range(len(norm_sequence) - sequence_length + 1):
-            window = norm_sequence[i:i + sequence_length]
-            if len(window) == sequence_length:
-                res = model.predict(np.expand_dims(window, axis=0), verbose=0)[0]
-                predicted_action = actions[np.argmax(res)]
-                confidence = float(res[np.argmax(res)] * 100)
-                logger.debug(f"Window {i}: Predicted {predicted_action} with confidence {confidence}%")
-                predictions.append(predicted_action)
-                confidences.append(confidence)
+        for i in range(0, len(norm_sequence) - sequence_length + 1, BATCH_SIZE):
+            batch_windows = [norm_sequence[j:j + sequence_length] 
+                           for j in range(i, min(i + BATCH_SIZE, len(norm_sequence) - sequence_length + 1))]
+            if batch_windows:
+                batch_results = model.predict(np.array(batch_windows), verbose=0)
+                for res in batch_results:
+                    predicted_action = actions[np.argmax(res)]
+                    confidence = float(res[np.argmax(res)] * 100)
+                    predictions.append(predicted_action)
+                    confidences.append(confidence)
+                
+                # Clear session after each batch
+                tf.keras.backend.clear_session()
 
         if not predictions:
             safe_unlink(temp_file_path)
@@ -303,8 +315,16 @@ def predict():
         tf.keras.backend.clear_session()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
-    # Add timeout configuration for gunicorn
-    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 300))
-    app.config['WORKER_TIMEOUT'] = timeout_seconds
-    app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production
+    port = int(os.environ.get('PORT', 10000))
+    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 120))  # Reduced timeout
+    worker_class = os.environ.get('WORKER_CLASS', 'sync')
+    workers = int(os.environ.get('WORKERS', 1))  # Limit workers
+    
+    app.config.update(
+        WORKER_TIMEOUT=timeout_seconds,
+        WORKER_CLASS=worker_class,
+        WORKERS=workers,
+        MAX_CONTENT_LENGTH=16 * 1024 * 1024  # Limit upload size to 16MB
+    )
+    
+    app.run(host='0.0.0.0', port=port, debug=False)
