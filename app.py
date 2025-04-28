@@ -8,27 +8,21 @@ import os
 import tempfile
 import logging
 import time
+import gc
+
+# Configure TensorFlow to be memory-efficient
+# This won't affect model accuracy, just how memory is allocated
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    for device in physical_devices:
+        tf.config.experimental.set_memory_growth(device, True)
+else:
+    # If no GPU, limit CPU memory growth
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
 
 app = Flask(__name__)
-CORS(app, resources={
-    r"/predict": {
-        "origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"],
-        "methods": ["POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-        "expose_headers": ["Access-Control-Allow-Origin"],
-        "supports_credentials": True,
-        "max_age": 600
-    }
-})
-
-# Add CORS headers to all responses
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', 'https://kamaibisubilar.vercel.app')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
-    response.headers.add('Access-Control-Max-Age', '600')
-    return response
+CORS(app, resources={r"/predict": {"origins": ["http://localhost:3000", "http://192.168.1.3:3000"]}})
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -162,45 +156,34 @@ except Exception as e:
     min_val[33*4+21*3+21*3:] = -1
     max_val[33*4+21*3+21*3:] = 1
 
-# Load model
-model_path = os.path.join(BASE_DIR, 'public', 'model', 'kamaibestlstm_Modified.keras')
-try:
-    if os.path.exists(model_path):
-        model = tf.keras.models.load_model(model_path)
-        logger.info("Model loaded successfully")
-    else:
-        raise FileNotFoundError(f"Model file not found at {model_path}")
-except Exception as e:
-    logger.error(f"Error loading model: {e}")
-    model = None
+# Load model on demand
+model = None
 
-MAX_FRAME_WIDTH = 240  # Reduced frame size
-MAX_FRAME_HEIGHT = 180
-BATCH_SIZE = 4  # Process predictions in smaller batches
-
-def process_video_frame(frame, holistic):
-    """Process a single frame with memory cleanup"""
-    try:
-        # Resize frame to reduce memory usage
-        frame = cv2.resize(frame, (MAX_FRAME_WIDTH, MAX_FRAME_HEIGHT))
-        image, results = mediapipe_detection(frame, holistic)
-        keypoints = None
-        if has_hand_keypoints(results):
-            keypoints = extract_keypoints(results)
-        # Clear MediaPipe resources
-        del image, results
-        return keypoints
-    except Exception as e:
-        logger.error(f"Error processing frame: {e}")
-        return None
-
-@app.route('/predict', methods=['POST', 'OPTIONS'])
-def predict():
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    logger.debug("Received request to /predict")
+def get_model():
+    global model
     if model is None:
+        model_path = os.path.join(BASE_DIR, 'public', 'model', 'kamaibestlstm_Modified.keras')
+        try:
+            if os.path.exists(model_path):
+                model = tf.keras.models.load_model(model_path)
+                logger.info("Model loaded successfully")
+            else:
+                raise FileNotFoundError(f"Model file not found at {model_path}")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            model = None
+    return model
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    logger.debug("Received request to /predict")
+
+    # Clear memory from previous requests
+    gc.collect()
+    
+    # Load model on demand
+    current_model = get_model()
+    if current_model is None:
         logger.error("Model not loaded")
         return jsonify({'error': 'Model not loaded'}), 500
 
@@ -229,81 +212,128 @@ def predict():
         return jsonify({'error': f'Failed to save video file: {e}'}), 500
 
     try:
-        # Process video with memory optimization
+        # Process video
+        cap = cv2.VideoCapture(temp_file_path)
+        if not cap.isOpened():
+            cap.release()
+            cv2.destroyAllWindows()
+            safe_unlink(temp_file_path)
+            logger.error("Failed to open video file")
+            return jsonify({'error': 'Failed to open video file'}), 500
+
+        # Get video properties to check size
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        logger.debug(f"Video dimensions: {frame_width}x{frame_height}, total frames: {total_frames}")
+
+        # Memory optimization: Process in chunks if the video is long
+        MAX_CHUNK_SIZE = 100  # Max frames to process at once
+        CHUNK_OVERLAP = 10    # Overlap between chunks to ensure continuity
+
         sequence = []
         hand_frame_count = 0
-        frame_count = 0
-        max_frames = min(60, sequence_length * 1.5)  # Reduced max frames
+        frames_to_process = min(total_frames, MAX_CHUNK_SIZE)
         
-        with mp_holistic.Holistic(
-            min_detection_confidence=0.3,
-            min_tracking_confidence=0.3,
-            static_image_mode=True  # Process frames independently to prevent memory accumulation
-        ) as holistic:
-            cap = cv2.VideoCapture(temp_file_path)
-            if not cap.isOpened():
-                raise ValueError("Failed to open video file")
-
-            while frame_count < max_frames and len(sequence) < sequence_length:
+        with mp_holistic.Holistic(min_detection_confidence=0.3, min_tracking_confidence=0.3, 
+                                  model_complexity=1) as holistic:  # model_complexity can be 0, 1, or 2
+            frame_idx = 0
+            while frame_idx < total_frames and len(sequence) < sequence_length:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                frame_count += 1
-                keypoints = process_video_frame(frame, holistic)
-                if keypoints is not None:
-                    sequence.append(keypoints)
-                    hand_frame_count += 1
+                # Process this frame
+                image, results = mediapipe_detection(frame, holistic)
                 
-                # Clear memory more frequently
-                if frame_count % 5 == 0:
-                    tf.keras.backend.clear_session()
-                    
-                # Force garbage collection
-                if frame_count % 10 == 0:
-                    import gc
+                # Free memory
+                del frame
+                
+                if has_hand_keypoints(results):
+                    try:
+                        keypoints = extract_keypoints(results)
+                        sequence.append(keypoints)
+                        hand_frame_count += 1
+                        
+                        # Free memory
+                        del keypoints
+                    except AttributeError as e:
+                        logger.warning(f"Skipping frame due to missing landmarks: {e}")
+                
+                # Free memory
+                del results
+                del image
+                
+                # Force garbage collection periodically
+                frame_idx += 1
+                if frame_idx % 10 == 0:
                     gc.collect()
-                
-            cap.release()
-            cv2.destroyAllWindows()
-
-        if hand_frame_count >= MIN_TEST_FRAMES:
-            while len(sequence) < sequence_length:
-                sequence.append(sequence[-1] if sequence else np.zeros(33*4 + 21*3 + 21*3 + 18))
-        else:
-            safe_unlink(temp_file_path)
-            logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
-            return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
-
+                    
+            # Check if we have enough frames with hand keypoints
+            if hand_frame_count >= MIN_TEST_FRAMES:
+                # Pad the sequence if needed (keeping exact same logic for accuracy)
+                while len(sequence) < sequence_length:
+                    sequence.append(sequence[-1] if sequence else np.zeros(33*4 + 21*3 + 21*3 + 18))
+            else:
+                cap.release()
+                cv2.destroyAllWindows()
+                safe_unlink(temp_file_path)
+                logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
+                return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
+        
+        cap.release()
+        cv2.destroyAllWindows()
         logger.debug(f"Extracted {hand_frame_count} frames with hand keypoints")
+
+        # Free more memory before normalization and prediction
+        gc.collect()
 
         # Apply global normalization
         norm_sequence = normalize_keypoints(np.array([sequence]), min_val, max_val)[0]
         logger.debug("Applied global normalization")
 
+        # Free memory
+        del sequence
+        gc.collect()
+
         # Predict
         predictions = []
         confidences = []
-        for i in range(0, len(norm_sequence) - sequence_length + 1, BATCH_SIZE):
-            batch_windows = [norm_sequence[j:j + sequence_length] 
-                           for j in range(i, min(i + BATCH_SIZE, len(norm_sequence) - sequence_length + 1))]
+        
+        # Process predictions in smaller batches to reduce memory usage
+        batch_size = 5
+        for i in range(0, len(norm_sequence) - sequence_length + 1, batch_size):
+            batch_end = min(i + batch_size, len(norm_sequence) - sequence_length + 1)
+            batch_windows = []
+            
+            for j in range(i, batch_end):
+                window = norm_sequence[j:j + sequence_length]
+                if len(window) == sequence_length:
+                    batch_windows.append(window)
+            
             if batch_windows:
-                batch_results = model.predict(np.array(batch_windows), verbose=0)
-                for res in batch_results:
+                # Predict on batch
+                batch_results = current_model.predict(np.array(batch_windows), verbose=0)
+                
+                # Process results
+                for k, res in enumerate(batch_results):
                     predicted_action = actions[np.argmax(res)]
                     confidence = float(res[np.argmax(res)] * 100)
+                    logger.debug(f"Window {i+k}: Predicted {predicted_action} with confidence {confidence}%")
                     predictions.append(predicted_action)
                     confidences.append(confidence)
                 
-                # Clear session after each batch
-                tf.keras.backend.clear_session()
+                # Free memory
+                del batch_windows
+                del batch_results
+                gc.collect()
 
         if not predictions:
             safe_unlink(temp_file_path)
             logger.error("No predictions made (insufficient frames for sliding window)")
             return jsonify({'error': 'No predictions made (insufficient frames for sliding window)'}), 400
 
-        # Handle Wait(FSL) misclassification
+        # Handle Wait(FSL) misclassification (keeping exact same logic for accuracy)
         final_prediction = max(set(predictions), key=predictions.count)
         final_confidence = np.mean([conf for pred, conf in zip(predictions, confidences) if pred == final_prediction])
         
@@ -323,6 +353,11 @@ def predict():
         logger.info(f"Prediction: {final_prediction} with confidence {final_confidence}%")
 
         # Clean up
+        del norm_sequence
+        del predictions
+        del confidences
+        gc.collect()
+        
         safe_unlink(temp_file_path)
         return jsonify(response)
 
@@ -331,21 +366,7 @@ def predict():
         if os.path.exists(temp_file_path):
             safe_unlink(temp_file_path)
         return jsonify({'error': str(e)}), 500
-    finally:
-        # Cleanup
-        tf.keras.backend.clear_session()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    timeout_seconds = int(os.environ.get('WORKER_TIMEOUT', 120))  # Reduced timeout
-    worker_class = os.environ.get('WORKER_CLASS', 'sync')
-    workers = int(os.environ.get('WORKERS', 1))  # Limit workers
-    
-    app.config.update(
-        WORKER_TIMEOUT=timeout_seconds,
-        WORKER_CLASS=worker_class,
-        WORKERS=workers,
-        MAX_CONTENT_LENGTH=16 * 1024 * 1024  # Limit upload size to 16MB
-    )
-    
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get('PORT', 10000))  # Use Render's PORT or default to 10000
+    app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False for production

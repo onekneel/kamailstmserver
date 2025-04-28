@@ -6,7 +6,7 @@ services:
     region: oregon
     preBuildCommand: apt-get update && apt-get install -y libopencv-dev libavutil-dev libavcodec-dev libavformat-dev
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 --threads 2 --worker-class gthread --max-requests 1 --max-requests-jitter 0 app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 1000 --workers 1 --threads 2 --worker-class gthread --max-requests 1 --max-requests-jitter 0 app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
