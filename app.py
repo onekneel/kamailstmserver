@@ -10,34 +10,36 @@ import logging
 import time
 import gc
 
-# Configure TensorFlow to be memory-efficient
-try:
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if physical_devices:
-        logger.info(f"Found {len(physical_devices)} GPU(s)")
-        for device in physical_devices:
-            tf.config.experimental.set_memory_growth(device, True)
-            logger.info(f"Enabled memory growth for GPU: {device}")
-    else:
-        logger.warning("No GPU devices found, using CPU only")
-        # If no GPU, limit CPU memory growth
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-except Exception as e:
-    logger.error(f"Error configuring TensorFlow devices: {e}")
-    # Fallback to CPU configuration
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-
-app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"]}})
-
-# Set up logging with more detailed format
+# Set up logging first
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Configure TensorFlow to be memory-efficient
+logger.info("Configuring TensorFlow...")
+try:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if (physical_devices):
+        logger.info(f"Found {len(physical_devices)} GPU(s)")
+        for device in physical_devices:
+            try:
+                tf.config.experimental.set_memory_growth(device, True)
+                logger.info(f"Enabled memory growth for GPU: {device}")
+            except Exception as dev_e:
+                logger.warning(f"Could not enable memory growth for {device}: {dev_e}")
+    else:
+        logger.warning("No GPU devices found, using CPU only")
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+except Exception as e:
+    logger.error(f"Error configuring TensorFlow devices: {e}")
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+
+app = Flask(__name__)
+CORS(app, resources={r"/predict": {"origins": ["https://kamaibisubilar.vercel.app", "http://localhost:3000", "http://192.168.1.3:3000"]}})
 
 # Initialize MediaPipe Holistic
 try:
