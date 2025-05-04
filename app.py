@@ -122,8 +122,8 @@ class ModelManager:
         # Load model
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         model_path = os.path.join(BASE_DIR, 'public', 'model', 'klstm.tflite')
-        min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'latest', 'min_val.npy')
-        max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'latest', 'max_val.npy')
+        min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints','min_val.npy')
+        max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'max_val.npy')
         
         # Control GPU memory growth
         gpus = tf.config.experimental.list_physical_devices('GPU')
