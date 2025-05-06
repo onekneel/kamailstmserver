@@ -2,7 +2,7 @@ flask==3.1.0
 flask-cors==5.0.1
 gunicorn==23.0.0
 numpy==1.26.4
-opencv-python-headless==4.11.0.86  # Use headless version to save memory
-tensorflow-cpu==2.18.0  # Use CPU-only version to save memory
+opencv-python-headless==4.11.0.86
+tensorflow-cpu==2.18.0
 mediapipe==0.10.9
 waitress==2.1.2

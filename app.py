@@ -11,19 +11,16 @@ import logging
 import time
 import base64
 import gc
-import subprocess
 
-# 1. Configure environment variables for speed and memory optimization
+# Configure environment variables
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF logs
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
-os.environ['OMP_NUM_THREADS'] = '2'  # Limit OpenMP threads
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'  # Enable OneDNN for speed
 
-# 2. Set up optimized logging
+# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 3. Initialize Flask app with file size limit
+# Initialize Flask app
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB limit
 CORS(app, resources={
@@ -40,7 +37,7 @@ mp_drawing = None
 sequence_buffer = None
 buffer_index = 0
 
-# 4. Lazy loading of MediaPipe with minimal complexity
+# Lazy loading of MediaPipe
 def load_mediapipe():
     global mp_holistic, mp_drawing
     if mp_holistic is None:
@@ -51,36 +48,69 @@ def load_mediapipe():
         logger.info(f"MediaPipe loaded in {time.time() - start:.2f} seconds")
     return mp_holistic, mp_drawing
 
-# 5. Optimized MediaPipe detection with minimal resolution
+# MediaPipe detection - MATCHED TO COLAB
 def mediapipe_detection(image, model):
-    # Use smaller resolution to save memory and increase speed
-    image = cv2.resize(image, (160, 120))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = model.process(image)
-    image = None  # Clear image to free memory
-    gc.collect()
-    return None, results
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image, results
 
-# 6. Optimized keypoint extraction
+# Extract keypoints - MATCHED TO COLAB
 def extract_keypoints(results):
-    # Simplified keypoint extraction for speed
+    # Standard keypoints
     pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33*4)
     lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
     rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
-    
-    # Simplified additional features (zeros)
-    additional_features = np.zeros(18)
-    
+
+    # Add relative positions (hand-to-head, hand-to-chest, hand-to-chin, hand-to-forehead, hand-to-arm) to match training
+    additional_features = np.zeros(18)  # 3 for left hand to head, 3 for right hand to chest, 3 for hand to chin, 3 for hand to forehead, 3 for left hand to left elbow, 3 for right hand to right elbow
+    if results.pose_landmarks and (results.left_hand_landmarks or results.right_hand_landmarks):
+        # Head (landmark 0), chest (midpoint of shoulders: landmarks 11 and 12)
+        head = np.array([results.pose_landmarks.landmark[0].x, results.pose_landmarks.landmark[0].y, results.pose_landmarks.landmark[0].z])
+        left_shoulder = np.array([results.pose_landmarks.landmark[11].x, results.pose_landmarks.landmark[11].y, results.pose_landmarks.landmark[11].z])
+        right_shoulder = np.array([results.pose_landmarks.landmark[12].x, results.pose_landmarks.landmark[12].y, results.pose_landmarks.landmark[12].z])
+        chest = (left_shoulder + right_shoulder) / 2
+
+        # Chin (face landmark 152) and forehead (face landmark 10)
+        chin = np.zeros(3)
+        forehead = np.zeros(3)
+        if results.face_landmarks:
+            chin = np.array([results.face_landmarks.landmark[152].x, results.face_landmarks.landmark[152].y, results.face_landmarks.landmark[152].z])
+            forehead = np.array([results.face_landmarks.landmark[10].x, results.face_landmarks.landmark[10].y, results.face_landmarks.landmark[10].z])
+
+        # Elbows (pose landmarks 13 and 14 for left and right elbows)
+        left_elbow = np.array([results.pose_landmarks.landmark[13].x, results.pose_landmarks.landmark[13].y, results.pose_landmarks.landmark[13].z])
+        right_elbow = np.array([results.pose_landmarks.landmark[14].x, results.pose_landmarks.landmark[14].y, results.pose_landmarks.landmark[14].z])
+
+        if results.left_hand_landmarks:
+            lh_center = np.array([results.left_hand_landmarks.landmark[0].x, results.left_hand_landmarks.landmark[0].y, results.left_hand_landmarks.landmark[0].z])
+            additional_features[0:3] = lh_center - head  # Left hand to head
+            additional_features[6:9] = lh_center - chin  # Left hand to chin
+            additional_features[9:12] = lh_center - forehead  # Left hand to forehead
+            additional_features[12:15] = lh_center - left_elbow  # Left hand to left elbow
+        if results.right_hand_landmarks:
+            rh_center = np.array([results.right_hand_landmarks.landmark[0].x, results.right_hand_landmarks.landmark[0].y, results.right_hand_landmarks.landmark[0].z])
+            additional_features[3:6] = rh_center - chest  # Right hand to chest
+            additional_features[15:18] = rh_center - right_elbow  # Right hand to right elbow
+
     return np.concatenate([pose, lh, rh, additional_features])
 
 def has_hand_keypoints(results):
-    return results.left_hand_landmarks is not None or results.right_hand_landmarks is not None
+    lh_present = results.left_hand_landmarks is not None and np.any(np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten())
+    rh_present = results.right_hand_landmarks is not None and np.any(np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten())
+    return lh_present or rh_present
 
-def normalize_keypoints(sequences, min_val, max_val):
+# Normalize keypoints - MATCHED TO COLAB
+def normalize_keypoints(sequences, min_val=None, max_val=None):
     sequences = np.array(sequences)
+    
+    if min_val is None or max_val is None:
+        min_val = np.min(sequences, axis=(0, 1)) if len(sequences.shape) > 2 else np.min(sequences, axis=0)
+        max_val = np.max(sequences, axis=(0, 1)) if len(sequences.shape) > 2 else np.max(sequences, axis=0)
+    
     range_val = max_val - min_val
     range_val[range_val < 1e-6] = 1e-6
-    return (sequences - min_val) / range_val
+    return (sequences - min_val) / range_val, min_val, max_val
 
 def safe_unlink(file_path):
     try:
@@ -89,7 +119,6 @@ def safe_unlink(file_path):
     except:
         pass
 
-# 7. Video validation - simplified for speed
 def validate_video(file_path):
     try:
         cap = cv2.VideoCapture(file_path)
@@ -101,7 +130,7 @@ def validate_video(file_path):
     except:
         return False
 
-# 8. Model and data loading with speed optimizations
+# Model manager with improved feature extraction
 class ModelManager:
     def __init__(self):
         self.model = None
@@ -110,7 +139,7 @@ class ModelManager:
         self.is_initialized = False
         self.actions = ['Goodbye', 'Hello', 'Thankyou', 'Please', 'Thankyou(FSL)', 'Wait(FSL)']
         self.sequence_length = 30
-        self.MIN_TEST_FRAMES = 5  # Reduced for faster processing
+        self.MIN_TEST_FRAMES = 10
 
     def initialize(self):
         if self.is_initialized:
@@ -128,10 +157,9 @@ class ModelManager:
         min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'min_val.npy')
         max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'max_val.npy')
         
-        # Load Keras model with proper error handling
+        # Load Keras model
         try:
-            # Fixed model loading without using set_session
-            self.model = load_model(model_path, compile=False)  # Skip compilation for speed
+            self.model = load_model(model_path, compile=False)
             logger.info(f"Keras model loaded successfully in {time.time() - start_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error loading Keras model: {e}")
@@ -139,7 +167,6 @@ class ModelManager:
             from tensorflow.keras.models import Sequential
             from tensorflow.keras.layers import Input, LSTM, Dense
             
-            # Fixed model creation with Input layer
             model = Sequential([
                 Input(shape=(self.sequence_length, 276)),
                 LSTM(32, activation='relu'),
@@ -182,7 +209,7 @@ def get_model_manager():
         buffer_index = 0
     return model_manager
 
-# 9. Prediction endpoints optimized for speed
+# Prediction endpoint with sliding window approach
 @app.route('/predict', methods=['POST'])
 def predict():
     global buffer_index
@@ -222,42 +249,37 @@ def predict():
             logger.error("Invalid or corrupted video file")
             return jsonify({'error': 'Invalid or corrupted video file'}), 400
         
-        # Process video with optimized settings for speed
+        # Process video with sliding window approach
         cap = cv2.VideoCapture(temp_file_path)
         if not cap.isOpened():
             logger.error("Failed to open video file")
             return jsonify({'error': 'Failed to open video file'}), 500
 
-        # Get video properties for faster processing
+        # Get video properties
         fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         # Calculate optimal frame skip based on video length
-        # For longer videos, skip more frames
-        if frame_count > 100:
-            FRAME_SKIP = 8
-        elif frame_count > 50:
-            FRAME_SKIP = 6
+        if total_frames > 100:
+            FRAME_SKIP = 3
         else:
-            FRAME_SKIP = 4
+            FRAME_SKIP = 2
             
-        logger.info(f"Video has {frame_count} frames at {fps} fps, using skip={FRAME_SKIP}")
+        logger.info(f"Video has {total_frames} frames at {fps} fps, using skip={FRAME_SKIP}")
         
-        sequence = np.zeros((manager.sequence_length, 276), dtype=np.float32)
-        seq_index = 0
-        hand_frame_count = 0
+        # Collect all frames with hand keypoints
+        all_keypoints = []
         frame_count = 0
-        max_frames = 60  # Limit processing
+        hand_frame_count = 0
 
-        # Use lowest complexity for MediaPipe for speed
+        # Use holistic model with face landmarks enabled
         with mp_holistic.Holistic(
-            min_detection_confidence=0.2,
-            min_tracking_confidence=0.2,
-            model_complexity=0,
-            enable_segmentation=False,
-            refine_face_landmarks=False
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+            model_complexity=1,  # Use medium complexity for better accuracy
+            refine_face_landmarks=True  # Enable face landmarks for additional features
         ) as holistic:
-            while seq_index < manager.sequence_length and frame_count < max_frames:
+            while frame_count < 300:  # Limit to 300 frames max
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -267,14 +289,12 @@ def predict():
                     continue
 
                 try:
-                    # Process frame with minimal memory usage
-                    _, results = mediapipe_detection(frame, holistic)
-                    frame = None  # Clear frame to free memory
+                    # Process frame with full feature extraction
+                    image, results = mediapipe_detection(frame, holistic)
                     
                     if has_hand_keypoints(results):
                         keypoints = extract_keypoints(results)
-                        sequence[seq_index] = keypoints
-                        seq_index += 1
+                        all_keypoints.append(keypoints)
                         hand_frame_count += 1
                     
                     # Clear memory after each frame
@@ -289,32 +309,77 @@ def predict():
             logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
             return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
 
-        # Normalize and predict
-        norm_sequence = normalize_keypoints([sequence], manager.min_val, manager.max_val)[0]
-        sequence = None  # Clear to free memory
+        # Normalize all keypoints
+        all_keypoints = np.array(all_keypoints)
+        norm_keypoints, _, _ = normalize_keypoints(all_keypoints)
         
-        # Use a single prediction for speed
-        input_data = np.expand_dims(norm_sequence[:manager.sequence_length], axis=0).astype(np.float32)
-        res = manager.model.predict(input_data, verbose=0)[0]
-        norm_sequence = None  # Clear to free memory
-        input_data = None  # Clear to free memory
+        # Use sliding window approach for prediction
+        predictions = []
+        confidences = []
         
-        predicted_action = manager.actions[np.argmax(res)]
-        confidence = float(res[np.argmax(res)] * 100)
-        
-        processing_time = time.time() - start_time
-        
-        response = {
-            'action': predicted_action,
-            'confidence': confidence,
-            'processing_time': processing_time
-        }
-        logger.info(f"Prediction: {predicted_action} with confidence {confidence:.2f}% in {processing_time:.2f} seconds")
-        
-        # Clear memory before returning
-        gc.collect()
-        
-        return jsonify(response)
+        # Ensure we have enough frames for at least one window
+        if len(norm_keypoints) >= manager.sequence_length:
+            # Create sliding windows
+            for i in range(len(norm_keypoints) - manager.sequence_length + 1):
+                window = norm_keypoints[i:i + manager.sequence_length]
+                
+                # Make prediction on this window
+                input_data = np.expand_dims(window, axis=0).astype(np.float32)
+                res = manager.model.predict(input_data, verbose=0)[0]
+                
+                predicted_action = manager.actions[np.argmax(res)]
+                confidence = float(res[np.argmax(res)] * 100)
+                
+                predictions.append(predicted_action)
+                confidences.append(confidence)
+                
+                # Clear memory
+                input_data = None
+                gc.collect()
+            
+            # Get the most common prediction
+            if predictions:
+                # Count occurrences of each prediction
+                prediction_counts = {}
+                for pred in predictions:
+                    if pred in prediction_counts:
+                        prediction_counts[pred] += 1
+                    else:
+                        prediction_counts[pred] = 1
+                
+                # Find the most common prediction
+                final_prediction = max(prediction_counts, key=prediction_counts.get)
+                
+                # Calculate average confidence for the final prediction
+                final_confidence = 0
+                count = 0
+                for i, pred in enumerate(predictions):
+                    if pred == final_prediction:
+                        final_confidence += confidences[i]
+                        count += 1
+                
+                if count > 0:
+                    final_confidence /= count
+                
+                # Create detailed response
+                response = {
+                    'action': final_prediction,
+                    'confidence': final_confidence,
+                    'processing_time': time.time() - start_time,
+                    'prediction_distribution': {action: predictions.count(action) for action in set(predictions)}
+                }
+                
+                logger.info(f"Prediction: {final_prediction} with confidence {final_confidence:.2f}% in {time.time() - start_time:.2f} seconds")
+                logger.info(f"Distribution: {response['prediction_distribution']}")
+                
+                # Clear memory before returning
+                gc.collect()
+                
+                return jsonify(response)
+            else:
+                return jsonify({'error': 'No predictions could be made'}), 500
+        else:
+            return jsonify({'error': f'Not enough frames for prediction. Need {manager.sequence_length}, got {len(norm_keypoints)}'}), 400
 
     finally:
         # Clean up resources
@@ -361,16 +426,15 @@ def predict_stream():
             logger.error("Failed to decode frame")
             return jsonify({'error': 'Failed to decode frame'}), 400
 
-        # Use lowest complexity for MediaPipe
+        # Use holistic model with face landmarks enabled
         with mp_holistic.Holistic(
-            min_detection_confidence=0.2,
-            min_tracking_confidence=0.2,
-            model_complexity=0,
-            enable_segmentation=False,
-            refine_face_landmarks=False
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+            model_complexity=1,
+            refine_face_landmarks=True
         ) as holistic:
             try:
-                _, results = mediapipe_detection(frame, holistic)
+                image, results = mediapipe_detection(frame, holistic)
                 frame = None  # Clear to free memory
                 
                 if has_hand_keypoints(results):
@@ -378,9 +442,11 @@ def predict_stream():
                     sequence_buffer[buffer_index] = keypoints
                     buffer_index = (buffer_index + 1) % manager.sequence_length
 
-                    # Reduced required frames for faster response
-                    if buffer_index >= 8:  
-                        norm_sequence = normalize_keypoints([sequence_buffer], manager.min_val, manager.max_val)[0]
+                    if buffer_index >= 10:  # Need at least 10 frames
+                        # Normalize the sequence
+                        norm_sequence, _, _ = normalize_keypoints([sequence_buffer])
+                        norm_sequence = norm_sequence[0]  # Get the first (and only) sequence
+                        
                         input_data = np.expand_dims(norm_sequence, axis=0).astype(np.float32)
                         res = manager.model.predict(input_data, verbose=0)[0]
                         norm_sequence = None  # Clear to free memory
@@ -403,7 +469,7 @@ def predict_stream():
                             'action': 'Processing',
                             'confidence': 0,
                             'frames_collected': buffer_index,
-                            'frames_needed': 8
+                            'frames_needed': 10
                         })
                 else:
                     return jsonify({
