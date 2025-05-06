@@ -137,9 +137,44 @@ def get_video_duration(file_path):
              '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
             capture_output=True, text=True, timeout=5
         )
-        return float(result.stdout)
-    except:
-        return float('inf')
+        # Debug the output
+        stdout = result.stdout.strip()
+        logger.info(f"ffprobe output: '{stdout}'")
+        
+        # Handle empty output
+        if not stdout:
+            logger.warning("Empty ffprobe output, using default duration")
+            return 10.0  # Default to a reasonable duration
+        
+        # Handle potential newlines or other characters
+        stdout = stdout.replace('\n', '').strip()
+        
+        try:
+            duration = float(stdout)
+            logger.info(f"Parsed video duration: {duration} seconds")
+            return duration
+        except ValueError as e:
+            logger.error(f"Failed to parse duration '{stdout}': {e}")
+            return 10.0  # Default to a reasonable duration
+    except Exception as e:
+        logger.error(f"Error getting video duration: {e}")
+        # If ffprobe fails, try using OpenCV as a fallback
+        try:
+            cap = cv2.VideoCapture(file_path)
+            if not cap.isOpened():
+                logger.error("Failed to open video with OpenCV")
+                return 10.0  # Default to a reasonable duration
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps if fps > 0 else 10.0
+            cap.release()
+            
+            logger.info(f"OpenCV calculated duration: {duration} seconds")
+            return duration
+        except Exception as cv_error:
+            logger.error(f"OpenCV duration calculation failed: {cv_error}")
+            return 10.0  # Default to a reasonable duration
 
 # 9. Model and data loading
 class ModelManager:
