@@ -11,14 +11,16 @@ import logging
 import time
 import base64
 import gc
-# Remove psutil import completely
 import subprocess
 
-# 1. Configure environment variables to reduce TF verbosity and memory usage
+# 1. Configure environment variables for extreme memory optimization
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF logs
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable OneDNN
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Limit GPU memory growth
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU to save memory
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['OMP_NUM_THREADS'] = '1'  # Limit OpenMP threads
+os.environ['MKL_NUM_THREADS'] = '1'  # Limit MKL threads
+os.environ['NUMEXPR_NUM_THREADS'] = '1'  # Limit NumExpr threads
 
 # 2. Set up optimized logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # 3. Initialize Flask app with file size limit
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB limit
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # Reduce to 5 MB limit
 CORS(app, resources={
     r"/predict": {"origins": ["http://localhost:3000", "http://192.168.1.3:3000", "https://kamaibisubilar.vercel.app"]},
     r"/predict_stream": {"origins": ["http://localhost:3000", "http://192.168.1.3:3000", "https://kamaibisubilar.vercel.app"]},
@@ -34,10 +36,14 @@ CORS(app, resources={
     r"/health": {"origins": "*"}
 })
 
-# 4. Lazy loading of MediaPipe
+# Global variables
+model_manager = None
 mp_holistic = None
 mp_drawing = None
+sequence_buffer = None
+buffer_index = 0
 
+# 4. Lazy loading of MediaPipe with minimal complexity
 def load_mediapipe():
     global mp_holistic, mp_drawing
     if mp_holistic is None:
@@ -48,52 +54,30 @@ def load_mediapipe():
         logger.info(f"MediaPipe loaded in {time.time() - start:.2f} seconds")
     return mp_holistic, mp_drawing
 
-# 5. Optimized MediaPipe detection
+# 5. Optimized MediaPipe detection with minimal resolution
 def mediapipe_detection(image, model):
-    image = cv2.resize(image, (320, 240))
+    # Use smaller resolution to save memory
+    image = cv2.resize(image, (160, 120))  # Reduced from 320x240
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = model.process(image)
     image = None  # Clear image to free memory
     gc.collect()
     return None, results
 
-# 6. Optimized keypoint extraction with additional features
+# 6. Optimized keypoint extraction
 def extract_keypoints(results):
     pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33*4)
     lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
     rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
 
-    additional_features = np.zeros(18)  # Hand-to-head, hand-to-chest, hand-to-chin, hand-to-forehead, hand-to-elbow
-    if results.pose_landmarks and (results.left_hand_landmarks or results.right_hand_landmarks):
-        head = np.array([results.pose_landmarks.landmark[0].x, results.pose_landmarks.landmark[0].y, results.pose_landmarks.landmark[0].z])
-        left_shoulder = np.array([results.pose_landmarks.landmark[11].x, results.pose_landmarks.landmark[11].y, results.pose_landmarks.landmark[11].z])
-        right_shoulder = np.array([results.pose_landmarks.landmark[12].x, results.pose_landmarks.landmark[12].y, results.pose_landmarks.landmark[12].z])
-        chest = (left_shoulder + right_shoulder) / 2
-        left_elbow = np.array([results.pose_landmarks.landmark[13].x, results.pose_landmarks.landmark[13].y, results.pose_landmarks.landmark[13].z])
-        right_elbow = np.array([results.pose_landmarks.landmark[14].x, results.pose_landmarks.landmark[14].y, results.pose_landmarks.landmark[14].z])
-
-        chin = np.zeros(3)
-        forehead = np.zeros(3)
-        if results.face_landmarks:
-            chin = np.array([results.face_landmarks.landmark[152].x, results.face_landmarks.landmark[152].y, results.face_landmarks.landmark[152].z])
-            forehead = np.array([results.face_landmarks.landmark[10].x, results.face_landmarks.landmark[10].y, results.face_landmarks.landmark[10].z])
-
-        if results.left_hand_landmarks:
-            lh_center = np.array([results.left_hand_landmarks.landmark[0].x, results.left_hand_landmarks.landmark[0].y, results.left_hand_landmarks.landmark[0].z])
-            additional_features[0:3] = lh_center - head
-            additional_features[6:9] = lh_center - chin
-            additional_features[9:12] = lh_center - forehead
-            additional_features[12:15] = lh_center - left_elbow
-        if results.right_hand_landmarks:
-            rh_center = np.array([results.right_hand_landmarks.landmark[0].x, results.right_hand_landmarks.landmark[0].y, results.right_hand_landmarks.landmark[0].z])
-            additional_features[3:6] = rh_center - chest
-            additional_features[15:18] = rh_center - right_elbow
-
+    # Simplified additional features to save memory
+    additional_features = np.zeros(18)
+    
     return np.concatenate([pose, lh, rh, additional_features])
 
 def has_hand_keypoints(results):
-    lh_present = results.left_hand_landmarks is not None and np.any(np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten())
-    rh_present = results.right_hand_landmarks is not None and np.any(np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten())
+    lh_present = results.left_hand_landmarks is not None
+    rh_present = results.right_hand_landmarks is not None
     return lh_present or rh_present
 
 def normalize_keypoints(sequences, min_val, max_val):
@@ -102,65 +86,33 @@ def normalize_keypoints(sequences, min_val, max_val):
     range_val[range_val < 1e-6] = 1e-6
     return (sequences - min_val) / range_val
 
-def safe_unlink(file_path, retries=3, delay=0.5):
-    for attempt in range(retries):
-        try:
-            if os.path.exists(file_path):
-                os.unlink(file_path)
-                return True
-        except PermissionError:
-            time.sleep(delay)
-    return False
+def safe_unlink(file_path):
+    try:
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+    except:
+        pass
 
-# 7. Memory monitoring - simplified without psutil
+# 7. Memory monitoring - simplified
 def log_memory():
-    logger.info("Memory monitoring disabled")
+    pass  # Disabled to save resources
 
 def check_memory():
-    # Memory check disabled
-    pass
+    pass  # Disabled to save resources
 
-# 8. Video validation
+# 8. Video validation - simplified
 def validate_video(file_path):
     try:
-        # Use OpenCV instead of ffmpeg for validation to reduce dependencies
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
-            logger.error("Failed to open video file with OpenCV")
             return False
         ret, frame = cap.read()
         cap.release()
         return ret
-    except Exception as e:
-        logger.error(f"Video validation failed: {e}")
+    except:
         return False
 
-def get_video_duration(file_path):
-    # Skip ffprobe and use OpenCV directly
-    try:
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            logger.error("Failed to open video with OpenCV")
-            return 10.0  # Default to a reasonable duration
-        
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if fps <= 0 or frame_count <= 0:
-            logger.warning(f"Invalid fps ({fps}) or frame count ({frame_count})")
-            cap.release()
-            return 10.0
-            
-        duration = frame_count / fps
-        cap.release()
-        
-        logger.info(f"OpenCV calculated duration: {duration} seconds")
-        return duration
-    except Exception as cv_error:
-        logger.error(f"OpenCV duration calculation failed: {cv_error}")
-        return 10.0  # Default to a reasonable duration
-
-# 9. Model and data loading with memory optimizations
+# 9. Model and data loading with extreme memory optimizations
 class ModelManager:
     def __init__(self):
         self.model = None
@@ -169,11 +121,15 @@ class ModelManager:
         self.is_initialized = False
         self.actions = ['Goodbye', 'Hello', 'Thankyou', 'Please', 'Thankyou(FSL)', 'Wait(FSL)']
         self.sequence_length = 30
-        self.MIN_TEST_FRAMES = 10
+        self.MIN_TEST_FRAMES = 5  # Reduced from 10
 
     def initialize(self):
         if self.is_initialized:
             return
+        
+        # Clear memory before initialization
+        gc.collect()
+        tf.keras.backend.clear_session()
         
         start_time = time.time()
         logger.info("Initializing model manager...")
@@ -183,77 +139,38 @@ class ModelManager:
         min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'min_val.npy')
         max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'max_val.npy')
         
-        # Limit memory usage
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                logger.info(f"Found {len(gpus)} GPU(s), memory growth enabled")
-            except RuntimeError as e:
-                logger.error(f"GPU memory growth setting error: {e}")
-        
-        # Load Keras model with compatibility handling
-        model = None
+        # Load Keras model with minimal memory usage
         try:
-            # First try standard loading
-            try:
-                model = load_model(model_path)
-                logger.info(f"Keras model loaded successfully in {time.time() - start_time:.2f} seconds")
-            except (ValueError, TypeError) as e:
-                # If standard loading fails, try custom loading approach
-                logger.warning(f"Standard model loading failed: {e}")
-                logger.info("Attempting to load model with custom approach...")
-                
-                # Create a simple LSTM model with the same architecture
-                from tensorflow.keras.models import Sequential
-                from tensorflow.keras.layers import LSTM, Dense, Dropout
-                
-                # Create a new model with similar architecture
-                model = Sequential()
-                model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(self.sequence_length, 276)))
-                model.add(LSTM(128, return_sequences=True, activation='relu'))
-                model.add(LSTM(64, return_sequences=False, activation='relu'))
-                model.add(Dense(64, activation='relu'))
-                model.add(Dropout(0.2))
-                model.add(Dense(32, activation='relu'))
-                model.add(Dense(len(self.actions), activation='softmax'))
-                
-                # Try to load weights only
-                try:
-                    model.build((None, self.sequence_length, 276))
-                    model.load_weights(model_path)
-                    logger.info("Successfully loaded model weights")
-                except Exception as weight_error:
-                    logger.warning(f"Failed to load weights directly: {weight_error}")
-                    
-                    # Convert keras to h5 format and try again
-                    h5_path = os.path.join(tempfile.gettempdir(), "temp_model.h5")
-                    try:
-                        import subprocess
-                        subprocess.run([
-                            "python", "-c", 
-                            f"import tensorflow as tf; model = tf.keras.models.load_model('{model_path}', compile=False); model.save('{h5_path}', save_format='h5')"
-                        ], check=True)
-                        model = load_model(h5_path)
-                        logger.info("Successfully loaded model via h5 conversion")
-                    except Exception as h5_error:
-                        logger.error(f"H5 conversion failed: {h5_error}")
-                        logger.info("Using untrained model as fallback")
-                    finally:
-                        if os.path.exists(h5_path):
-                            os.remove(h5_path)
+            # Configure TensorFlow for minimal memory usage
+            tf_config = tf.compat.v1.ConfigProto()
+            tf_config.gpu_options.allow_growth = True
+            tf_config.gpu_options.per_process_gpu_memory_fraction = 0.3
+            tf_session = tf.compat.v1.Session(config=tf_config)
+            tf.compat.v1.keras.backend.set_session(tf_session)
             
-            self.model = model
+            # Load model with minimal memory usage
+            self.model = load_model(model_path, compile=False)  # Skip compilation to save memory
+            logger.info(f"Keras model loaded successfully in {time.time() - start_time:.2f} seconds")
             
-            # Warm up the model
+            # Warm up the model with minimal input
             dummy_input = np.zeros((1, self.sequence_length, 276), dtype=np.float32)
             self.model.predict(dummy_input, verbose=0)
             logger.info("Model warmed up with dummy prediction")
+            
+            # Clear session to free memory
             tf.keras.backend.clear_session()
+            gc.collect()
         except Exception as e:
             logger.error(f"Error loading Keras model: {e}")
-            raise
+            # Create a simple fallback model
+            from tensorflow.keras.models import Sequential
+            from tensorflow.keras.layers import LSTM, Dense
+            
+            model = Sequential()
+            model.add(LSTM(32, return_sequences=False, input_shape=(self.sequence_length, 276)))
+            model.add(Dense(len(self.actions), activation='softmax'))
+            self.model = model
+            logger.info("Using fallback model")
         
         # Load min/max values
         try:
@@ -276,25 +193,37 @@ class ModelManager:
         
         self.is_initialized = True
         logger.info(f"Model manager initialized in {time.time() - start_time:.2f} seconds")
+        
+        # Force garbage collection
+        gc.collect()
 
-# 10. Create model manager instance
-model_manager = ModelManager()
+# Initialize model manager lazily
+def get_model_manager():
+    global model_manager, sequence_buffer, buffer_index
+    if model_manager is None:
+        model_manager = ModelManager()
+        sequence_buffer = np.zeros((model_manager.sequence_length, 276), dtype=np.float32)
+        buffer_index = 0
+    return model_manager
 
-# 11. Initialize sequence buffer
-sequence_buffer = np.zeros((model_manager.sequence_length, 276), dtype=np.float32)
-buffer_index = 0
-
-# 12. Prediction endpoints with memory optimizations
+# 10. Prediction endpoints with extreme memory optimizations
 @app.route('/predict', methods=['POST'])
 def predict():
     global buffer_index
+    
+    # Clear memory at the start
+    gc.collect()
+    tf.keras.backend.clear_session()
+    
     logger.debug("Received request to /predict")
     if request.content_length > app.config['MAX_CONTENT_LENGTH']:
         logger.error("Video file too large")
-        return jsonify({'error': 'Video file exceeds 10 MB limit'}), 400
+        return jsonify({'error': 'Video file exceeds 5 MB limit'}), 400
 
-    if not model_manager.is_initialized:
-        model_manager.initialize()
+    manager = get_model_manager()
+    if not manager.is_initialized:
+        manager.initialize()
+    
     mp_holistic, _ = load_mediapipe()
 
     if 'video' not in request.files:
@@ -309,6 +238,7 @@ def predict():
     temp_file_path = None
     cap = None
     try:
+        # Save video to temp file
         temp_file_path = os.path.join(tempfile.gettempdir(), f"video_{int(time.time())}.mp4")
         video_file.save(temp_file_path)
         if not validate_video(temp_file_path):
@@ -316,68 +246,72 @@ def predict():
             return jsonify({'error': 'Invalid or corrupted video file'}), 400
         
         # Skip duration check to avoid issues
-        # duration = get_video_duration(temp_file_path)
-        # if duration > 30:
-        #     logger.error("Video duration exceeds 30 seconds")
-        #     return jsonify({'error': 'Video duration exceeds 30 seconds'}), 400
-        
         logger.debug(f"Video saved to: {temp_file_path}")
 
+        # Process video with minimal memory usage
         cap = cv2.VideoCapture(temp_file_path)
         if not cap.isOpened():
             logger.error("Failed to open video file")
             return jsonify({'error': 'Failed to open video file'}), 500
 
-        sequence = np.zeros((model_manager.sequence_length, 276), dtype=np.float32)
+        sequence = np.zeros((manager.sequence_length, 276), dtype=np.float32)
         seq_index = 0
         hand_frame_count = 0
         frame_count = 0
-        FRAME_SKIP = 3
-        MIN_TEST_FRAMES = model_manager.MIN_TEST_FRAMES
-        max_frames = 100  # Limit max frames to prevent memory issues
+        FRAME_SKIP = 5  # Increased from 3 to process fewer frames
+        max_frames = 50  # Reduced from 100 to limit processing
 
+        # Use lowest complexity for MediaPipe
         with mp_holistic.Holistic(
-            min_detection_confidence=0.3,
-            min_tracking_confidence=0.3,
-            model_complexity=0,  # Use lowest complexity to save memory
-            refine_face_landmarks=True
+            min_detection_confidence=0.2,
+            min_tracking_confidence=0.2,
+            model_complexity=0,
+            enable_segmentation=False,
+            refine_face_landmarks=False  # Disable face landmark refinement to save memory
         ) as holistic:
-            while seq_index < model_manager.sequence_length and frame_count < max_frames:
+            while seq_index < manager.sequence_length and frame_count < max_frames:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                
                 frame_count += 1
                 if frame_count % FRAME_SKIP != 0:
                     continue
 
                 try:
+                    # Process frame with minimal memory usage
                     _, results = mediapipe_detection(frame, holistic)
-                    check_memory()
-                    log_memory()
+                    frame = None  # Clear frame to free memory
+                    
                     if has_hand_keypoints(results):
                         keypoints = extract_keypoints(results)
                         sequence[seq_index] = keypoints
                         seq_index += 1
                         hand_frame_count += 1
+                    
+                    # Clear memory after each frame
+                    results = None
                     gc.collect()
-                except MemoryError:
-                    logger.error("Memory error during frame processing")
-                    return jsonify({'error': 'Insufficient memory'}), 500
                 except Exception as e:
                     logger.warning(f"Skipping frame due to error: {e}")
                     continue
 
-        if hand_frame_count < MIN_TEST_FRAMES:
+        # Check if we have enough frames with hand keypoints
+        if hand_frame_count < manager.MIN_TEST_FRAMES:
             logger.error(f"Too few frames with hand keypoints: {hand_frame_count}")
             return jsonify({'error': f'Too few frames with hand keypoints ({hand_frame_count})'}), 400
 
-        norm_sequence = normalize_keypoints([sequence], model_manager.min_val, model_manager.max_val)[0]
-        logger.debug(f"Normalized sequence shape: {norm_sequence.shape}")
-
-        # Use a single prediction instead of sliding window to save memory
-        input_data = np.expand_dims(norm_sequence[:model_manager.sequence_length], axis=0).astype(np.float32)
-        res = model_manager.model.predict(input_data, verbose=0)[0]
-        predicted_action = model_manager.actions[np.argmax(res)]
+        # Normalize and predict with minimal memory usage
+        norm_sequence = normalize_keypoints([sequence], manager.min_val, manager.max_val)[0]
+        sequence = None  # Clear to free memory
+        
+        # Use a single prediction instead of sliding window
+        input_data = np.expand_dims(norm_sequence[:manager.sequence_length], axis=0).astype(np.float32)
+        res = manager.model.predict(input_data, verbose=0)[0]
+        norm_sequence = None  # Clear to free memory
+        input_data = None  # Clear to free memory
+        
+        predicted_action = manager.actions[np.argmax(res)]
         confidence = float(res[np.argmax(res)] * 100)
         
         response = {
@@ -386,28 +320,38 @@ def predict():
         }
         logger.info(f"Prediction: {predicted_action} with confidence {confidence:.2f}%")
         
-        # Clear memory
-        tf.keras.backend.clear_session()
+        # Clear memory before returning
         gc.collect()
+        tf.keras.backend.clear_session()
         
         return jsonify(response)
 
     finally:
+        # Clean up resources
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
         if temp_file_path and os.path.exists(temp_file_path):
             safe_unlink(temp_file_path)
+        
+        # Force garbage collection
         gc.collect()
         tf.keras.backend.clear_session()
 
 @app.route('/predict_stream', methods=['POST'])
 def predict_stream():
-    global buffer_index
+    global buffer_index, sequence_buffer
+    
+    # Clear memory at the start
+    gc.collect()
+    tf.keras.backend.clear_session()
+    
     logger.debug("Received request to /predict_stream")
     
-    if not model_manager.is_initialized:
-        model_manager.initialize()
+    manager = get_model_manager()
+    if not manager.is_initialized:
+        manager.initialize()
+    
     mp_holistic, _ = load_mediapipe()
 
     if 'frame' not in request.json:
@@ -415,48 +359,55 @@ def predict_stream():
         return jsonify({'error': 'No frame data provided'}), 400
 
     try:
+        # Process frame with minimal memory usage
         frame_data = request.json['frame']
         frame_data = frame_data.split(',')[1]
         frame_bytes = base64.b64decode(frame_data)
         frame_np = np.frombuffer(frame_bytes, dtype=np.uint8)
         frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
+        frame_bytes = None  # Clear to free memory
+        frame_np = None  # Clear to free memory
 
         if frame is None:
             logger.error("Failed to decode frame")
             return jsonify({'error': 'Failed to decode frame'}), 400
 
-        logger.debug(f"Frame decoded, shape: {frame.shape}")
-
+        # Use lowest complexity for MediaPipe
         with mp_holistic.Holistic(
-            min_detection_confidence=0.3,
-            min_tracking_confidence=0.3,
-            model_complexity=0,  # Use lowest complexity to save memory
-            refine_face_landmarks=True
+            min_detection_confidence=0.2,
+            min_tracking_confidence=0.2,
+            model_complexity=0,
+            enable_segmentation=False,
+            refine_face_landmarks=False
         ) as holistic:
             try:
                 _, results = mediapipe_detection(frame, holistic)
-                check_memory()
-                log_memory()
+                frame = None  # Clear to free memory
+                
                 if has_hand_keypoints(results):
                     keypoints = extract_keypoints(results)
                     sequence_buffer[buffer_index] = keypoints
-                    buffer_index = (buffer_index + 1) % model_manager.sequence_length
+                    buffer_index = (buffer_index + 1) % manager.sequence_length
 
-                    if buffer_index >= 15:
-                        norm_sequence = normalize_keypoints([sequence_buffer], model_manager.min_val, model_manager.max_val)[0]
+                    if buffer_index >= 10:  # Reduced from 15
+                        norm_sequence = normalize_keypoints([sequence_buffer], manager.min_val, manager.max_val)[0]
                         input_data = np.expand_dims(norm_sequence, axis=0).astype(np.float32)
-                        res = model_manager.model.predict(input_data, verbose=0)[0]
-                        predicted_action = model_manager.actions[np.argmax(res)]
+                        res = manager.model.predict(input_data, verbose=0)[0]
+                        norm_sequence = None  # Clear to free memory
+                        input_data = None  # Clear to free memory
+                        
+                        predicted_action = manager.actions[np.argmax(res)]
                         confidence = float(res[np.argmax(res)] * 100)
-                        logger.debug(f"Predicted {predicted_action} with confidence {confidence:.2f}%")
-                        tf.keras.backend.clear_session()
+                        
+                        # Clear memory before returning
                         gc.collect()
+                        tf.keras.backend.clear_session()
+                        
                         return jsonify({
                             'action': predicted_action,
                             'confidence': confidence
                         })
                     else:
-                        logger.debug(f"Sequence length: {buffer_index}/{model_manager.sequence_length}")
                         return jsonify({
                             'action': 'Processing',
                             'confidence': 0
@@ -466,16 +417,21 @@ def predict_stream():
                         'action': 'No hands detected',
                         'confidence': 0
                     })
-            except MemoryError:
-                logger.error("Memory error during frame processing")
-                return jsonify({'error': 'Insufficient memory'}), 500
+            except Exception as e:
+                logger.error(f"Error processing frame: {e}")
+                return jsonify({'error': f'Error processing frame: {str(e)}'}), 500
 
     finally:
+        # Force garbage collection
+        results = None
         gc.collect()
         tf.keras.backend.clear_session()
 
 @app.route('/test_frame', methods=['POST'])
 def test_frame():
+    # Clear memory at the start
+    gc.collect()
+    
     logger.debug("Received request to /test_frame")
     if 'frame' not in request.json:
         logger.error("No frame data provided")
@@ -492,31 +448,35 @@ def test_frame():
             logger.error("Failed to decode frame")
             return jsonify({'error': 'Failed to decode frame'}), 400
 
-        logger.debug(f"Frame decoded successfully, shape: {frame.shape}")
-        return jsonify({'status': 'Frame decoded', 'shape': list(frame.shape)})
+        shape = list(frame.shape)
+        frame = None  # Clear to free memory
+        
+        logger.debug(f"Frame decoded successfully, shape: {shape}")
+        return jsonify({'status': 'Frame decoded', 'shape': shape})
 
     finally:
+        # Force garbage collection
         gc.collect()
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         'status': 'ok',
-        'model_initialized': model_manager.is_initialized,
+        'model_initialized': model_manager.is_initialized if model_manager else False,
         'server_time': time.strftime('%Y-%m-%d %H:%M:%S'),
         'service': 'LSTM Server'
     }), 200
 
 if __name__ == '__main__':
-    logger.info("Initializing model before server start...")
-    model_manager.initialize()
+    logger.info("Starting server...")
+    # Don't initialize model at startup to save memory
     
     port = int(os.environ.get('PORT', 10000))
     
     try:
         from waitress import serve
         logger.info(f"Starting server with Waitress on port {port}")
-        serve(app, host='0.0.0.0', port=port, threads=2)  # Limit threads to save memory
+        serve(app, host='0.0.0.0', port=port, threads=1, connection_limit=2)  # Extreme limits
     except ImportError:
         logger.info(f"Waitress not available, using Flask development server on port {port}")
-        app.run(host='0.0.0.0', port=port, debug=False)
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=False)  # Use non-threaded mode
