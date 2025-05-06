@@ -1,26 +1,23 @@
 import os
 
 # Timeout configuration
-timeout = 120  # Increased for .keras model
-graceful_timeout = 120
+timeout = 60  # Reduced to 60 seconds; sufficient for frame processing
+graceful_timeout = 60
 keepalive = 5
 
 # Worker configuration
-workers = 1  # Single worker for 512 MB RAM
-worker_class = 'sync'
-worker_connections = 1000
+workers = 1  # Use 1 worker to stay within 512 MB RAM
+worker_class = 'sync'  # Keep sync for CPU-bound tasks
+worker_connections = 1000  # Ignored for sync workers, but harmless
 
 # Logging
 accesslog = '-'
 errorlog = '-'
-loglevel = 'info'
+loglevel = 'info'  # Switch to info to reduce logging overhead
 
 # Prevent memory leaks
-max_requests = 500  # Frequent restarts for .keras model
+max_requests = 1000
 max_requests_jitter = 50
-
-# Preload app to share model memory
-preload_app = True
 
 # Limits
 limit_request_line = 4096
