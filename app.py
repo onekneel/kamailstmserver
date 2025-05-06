@@ -11,12 +11,14 @@ import logging
 import time
 import base64
 import gc
-# import psutil  # Removed psutil import
+# Remove psutil import completely
 import subprocess
 
-# 1. Configure environment variables to reduce TF verbosity
+# 1. Configure environment variables to reduce TF verbosity and memory usage
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF logs
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable OneDNN
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Limit GPU memory growth
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU to save memory
 
 # 2. Set up optimized logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -110,73 +112,55 @@ def safe_unlink(file_path, retries=3, delay=0.5):
             time.sleep(delay)
     return False
 
-# 7. Memory monitoring
+# 7. Memory monitoring - simplified without psutil
 def log_memory():
-    logger.info("Memory monitoring disabled (psutil not available)")
+    logger.info("Memory monitoring disabled")
 
 def check_memory():
-    # Memory check disabled (psutil not available)
+    # Memory check disabled
     pass
 
 # 8. Video validation
 def validate_video(file_path):
     try:
-        result = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-i', file_path, '-f', 'null', '-'],
-            capture_output=True, text=True, timeout=10
-        )
-        return result.returncode == 0
+        # Use OpenCV instead of ffmpeg for validation to reduce dependencies
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.error("Failed to open video file with OpenCV")
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return ret
     except Exception as e:
         logger.error(f"Video validation failed: {e}")
         return False
 
 def get_video_duration(file_path):
+    # Skip ffprobe and use OpenCV directly
     try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
-            capture_output=True, text=True, timeout=5
-        )
-        # Debug the output
-        stdout = result.stdout.strip()
-        logger.info(f"ffprobe output: '{stdout}'")
-        
-        # Handle empty output
-        if not stdout:
-            logger.warning("Empty ffprobe output, using default duration")
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.error("Failed to open video with OpenCV")
             return 10.0  # Default to a reasonable duration
         
-        # Handle potential newlines or other characters
-        stdout = stdout.replace('\n', '').strip()
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        try:
-            duration = float(stdout)
-            logger.info(f"Parsed video duration: {duration} seconds")
-            return duration
-        except ValueError as e:
-            logger.error(f"Failed to parse duration '{stdout}': {e}")
-            return 10.0  # Default to a reasonable duration
-    except Exception as e:
-        logger.error(f"Error getting video duration: {e}")
-        # If ffprobe fails, try using OpenCV as a fallback
-        try:
-            cap = cv2.VideoCapture(file_path)
-            if not cap.isOpened():
-                logger.error("Failed to open video with OpenCV")
-                return 10.0  # Default to a reasonable duration
-            
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = frame_count / fps if fps > 0 else 10.0
+        if fps <= 0 or frame_count <= 0:
+            logger.warning(f"Invalid fps ({fps}) or frame count ({frame_count})")
             cap.release()
+            return 10.0
             
-            logger.info(f"OpenCV calculated duration: {duration} seconds")
-            return duration
-        except Exception as cv_error:
-            logger.error(f"OpenCV duration calculation failed: {cv_error}")
-            return 10.0  # Default to a reasonable duration
+        duration = frame_count / fps
+        cap.release()
+        
+        logger.info(f"OpenCV calculated duration: {duration} seconds")
+        return duration
+    except Exception as cv_error:
+        logger.error(f"OpenCV duration calculation failed: {cv_error}")
+        return 10.0  # Default to a reasonable duration
 
-# 9. Model and data loading
+# 9. Model and data loading with memory optimizations
 class ModelManager:
     def __init__(self):
         self.model = None
@@ -199,7 +183,7 @@ class ModelManager:
         min_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'min_val.npy')
         max_val_path = os.path.join(BASE_DIR, 'public', 'keypoints', 'max_val.npy')
         
-        # Limit GPU memory growth
+        # Limit memory usage
         gpus = tf.config.experimental.list_physical_devices('GPU')
         if gpus:
             try:
@@ -300,7 +284,7 @@ model_manager = ModelManager()
 sequence_buffer = np.zeros((model_manager.sequence_length, 276), dtype=np.float32)
 buffer_index = 0
 
-# 12. Prediction endpoints
+# 12. Prediction endpoints with memory optimizations
 @app.route('/predict', methods=['POST'])
 def predict():
     global buffer_index
@@ -330,10 +314,13 @@ def predict():
         if not validate_video(temp_file_path):
             logger.error("Invalid or corrupted video file")
             return jsonify({'error': 'Invalid or corrupted video file'}), 400
-        duration = get_video_duration(temp_file_path)
-        if duration > 30:
-            logger.error("Video duration exceeds 30 seconds")
-            return jsonify({'error': 'Video duration exceeds 30 seconds'}), 400
+        
+        # Skip duration check to avoid issues
+        # duration = get_video_duration(temp_file_path)
+        # if duration > 30:
+        #     logger.error("Video duration exceeds 30 seconds")
+        #     return jsonify({'error': 'Video duration exceeds 30 seconds'}), 400
+        
         logger.debug(f"Video saved to: {temp_file_path}")
 
         cap = cv2.VideoCapture(temp_file_path)
@@ -347,13 +334,13 @@ def predict():
         frame_count = 0
         FRAME_SKIP = 3
         MIN_TEST_FRAMES = model_manager.MIN_TEST_FRAMES
-        max_frames = 100
+        max_frames = 100  # Limit max frames to prevent memory issues
 
         with mp_holistic.Holistic(
-            min_detection_confidence=0.3,  # Match testing code
+            min_detection_confidence=0.3,
             min_tracking_confidence=0.3,
-            model_complexity=0,
-            refine_face_landmarks=True  # Needed for chin/forehead
+            model_complexity=0,  # Use lowest complexity to save memory
+            refine_face_landmarks=True
         ) as holistic:
             while seq_index < model_manager.sequence_length and frame_count < max_frames:
                 ret, frame = cap.read()
@@ -387,33 +374,22 @@ def predict():
         norm_sequence = normalize_keypoints([sequence], model_manager.min_val, model_manager.max_val)[0]
         logger.debug(f"Normalized sequence shape: {norm_sequence.shape}")
 
-        predictions = []
-        confidences = []
-        for i in range(len(norm_sequence) - model_manager.sequence_length + 1):
-            window = norm_sequence[i:i + model_manager.sequence_length]
-            if len(window) == model_manager.sequence_length:
-                input_data = np.expand_dims(window, axis=0).astype(np.float32)
-                res = model_manager.model.predict(input_data, verbose=0)[0]
-                predicted_action = model_manager.actions[np.argmax(res)]
-                confidence = float(res[np.argmax(res)] * 100)
-                logger.debug(f"Window {i}: Predicted {predicted_action} with confidence {confidence:.2f}%")
-                predictions.append(predicted_action)
-                confidences.append(confidence)
-                tf.keras.backend.clear_session()
-                gc.collect()
-
-        if not predictions:
-            logger.error("No predictions made (insufficient frames for sliding window)")
-            return jsonify({'error': 'No predictions made (insufficient frames for sliding window)'}), 400
-
-        final_prediction = max(set(predictions), key=predictions.count)
-        final_confidence = np.mean([conf for pred, conf in zip(predictions, confidences) if pred == final_prediction])
-
+        # Use a single prediction instead of sliding window to save memory
+        input_data = np.expand_dims(norm_sequence[:model_manager.sequence_length], axis=0).astype(np.float32)
+        res = model_manager.model.predict(input_data, verbose=0)[0]
+        predicted_action = model_manager.actions[np.argmax(res)]
+        confidence = float(res[np.argmax(res)] * 100)
+        
         response = {
-            'action': final_prediction,
-            'confidence': final_confidence
+            'action': predicted_action,
+            'confidence': confidence
         }
-        logger.info(f"Prediction: {final_prediction} with confidence {final_confidence:.2f}%")
+        logger.info(f"Prediction: {predicted_action} with confidence {confidence:.2f}%")
+        
+        # Clear memory
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
         return jsonify(response)
 
     finally:
@@ -454,7 +430,7 @@ def predict_stream():
         with mp_holistic.Holistic(
             min_detection_confidence=0.3,
             min_tracking_confidence=0.3,
-            model_complexity=0,
+            model_complexity=0,  # Use lowest complexity to save memory
             refine_face_landmarks=True
         ) as holistic:
             try:
@@ -468,9 +444,6 @@ def predict_stream():
 
                     if buffer_index >= 15:
                         norm_sequence = normalize_keypoints([sequence_buffer], model_manager.min_val, model_manager.max_val)[0]
-                        while len(norm_sequence) < model_manager.sequence_length:
-                            norm_sequence = np.vstack([norm_sequence, norm_sequence[-1]])
-                        norm_sequence = norm_sequence[:model_manager.sequence_length]
                         input_data = np.expand_dims(norm_sequence, axis=0).astype(np.float32)
                         res = model_manager.model.predict(input_data, verbose=0)[0]
                         predicted_action = model_manager.actions[np.argmax(res)]
@@ -543,7 +516,7 @@ if __name__ == '__main__':
     try:
         from waitress import serve
         logger.info(f"Starting server with Waitress on port {port}")
-        serve(app, host='0.0.0.0', port=port)
+        serve(app, host='0.0.0.0', port=port, threads=2)  # Limit threads to save memory
     except ImportError:
         logger.info(f"Waitress not available, using Flask development server on port {port}")
         app.run(host='0.0.0.0', port=port, debug=False)
